@@ -1,0 +1,18 @@
+# Local captures and secret key material
+*.pcap
+*.pcapng
+*.keylog
+*keylog*.txt
+
+# Generated validation and release output
+build/
+dist/
+__pycache__/
+*.py[cod]
+
+# Editor and operating-system clutter
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*~

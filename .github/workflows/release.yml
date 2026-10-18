@@ -1,0 +1,53 @@
+name: Package release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Validate and package tagged revision
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Validate stable SemVer tag
+        shell: bash
+        run: |
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo 'Expected a stable SemVer tag: vMAJOR.MINOR.PATCH'
+            exit 1
+          fi
+
+      - name: Install validation tools
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y lua5.3 lua-check tshark
+
+      - name: Validate and package
+        run: make package LUA=lua5.3 LUAC=luac5.3 VERSION="$GITHUB_REF_NAME"
+
+      - name: Verify release contents and checksum
+        shell: bash
+        run: |
+          archive="dist/dgproto-wireshark-${GITHUB_REF_NAME#v}.zip"
+          python -m zipfile --list "$archive"
+          sha256sum --check "$archive.sha256"
+          test "$(python -c 'import sys,zipfile; print(len(zipfile.ZipFile(sys.argv[1]).namelist()))' "$archive")" = 3
+
+      - name: Retain package as workflow artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dgproto-wireshark-${{ github.ref_name }}
+          path: |
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 30
