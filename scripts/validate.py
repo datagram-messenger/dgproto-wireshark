@@ -12,7 +12,8 @@ import sys
 REQUIRED_SNIPPETS = (
     'Proto("dgproto", "DGProto v1")',
     'Pref.uint  ("TCP Port",        9900',
-    'Pref.string("Keylog File"',
+    'prefs.keylog_file = Pref.string(',
+    '"Keylog File",',
     'local HEADER_LEN   = 40',
     'local AEAD_TAG_LEN = 16',
     'local MAGIC        = "DGP1"',
@@ -57,7 +58,7 @@ def tshark_validation(plugin: pathlib.Path, command: str) -> None:
         print(f"tshark validation: skipped ({command!r} not found)")
         return
     result = subprocess.run(
-        [executable, "-X", f"lua_script:{plugin.resolve()}", "-G", "protocols"],
+        [executable, "-G", "protocols", "-X", f"lua_script:{plugin.resolve()}"],
         check=False,
         capture_output=True,
         text=True,

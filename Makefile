@@ -4,6 +4,7 @@ LUA ?= lua
 LUAC ?= luac
 LUACHECK ?= luacheck
 TSHARK ?= tshark
+PYTHON ?= python3
 VERSION ?= dev
 
 check: syntax lint selftest
@@ -15,10 +16,10 @@ lint:
 	$(LUACHECK) --config .luacheckrc plugin/dgproto.lua
 
 selftest:
-	python scripts/validate.py --plugin plugin/dgproto.lua --tshark "$(TSHARK)"
+	$(PYTHON) scripts/validate.py --plugin plugin/dgproto.lua --tshark "$(TSHARK)"
 
 package: check
-	python scripts/package_release.py --version "$(VERSION)" --output-dir dist
+	$(PYTHON) scripts/package_release.py --version "$(VERSION)" --output-dir dist
 
 clean:
-	python -c "import shutil; [shutil.rmtree(p, ignore_errors=True) for p in ('build', 'dist', '__pycache__')]"
+	$(PYTHON) -c "import shutil; [shutil.rmtree(p, ignore_errors=True) for p in ('build', 'dist', '__pycache__')]"

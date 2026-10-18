@@ -7,7 +7,11 @@ local dgproto = Proto("dgproto", "DGProto v1")
 -- ── Preferences ──────────────────────────────────────────────────────────────
 local prefs = dgproto.prefs
 prefs.tcp_port    = Pref.uint  ("TCP Port",        9900,   "TCP port DGProto listens on")
-prefs.keylog_file = Pref.string("Keylog File",     "",     "Path to dgproto_keylog.txt (overrides DGPROTO_KEYLOG env var)")
+prefs.keylog_file = Pref.string(
+    "Keylog File",
+    "",
+    "Path to dgproto_keylog.txt (overrides DGPROTO_KEYLOG env var)"
+)
 
 -- ── Protocol fields ───────────────────────────────────────────────────────────
 local f = dgproto.fields
@@ -63,11 +67,26 @@ f.error_context  = ProtoField.string ("dgproto.error_context",   "Context",     
 -- NOTE: expert.group.* / expert.severity.* live in the GLOBAL `expert` table.
 -- Do not shadow it with `local expert = dgproto.experts` — that makes
 -- `expert.group` nil and breaks loading.
-local ef_handshake    = ProtoExpert.new("dgproto.handshake",    "DGProto Handshake",         expert.group.PROTOCOL,  expert.severity.NOTE)
-local ef_encrypted    = ProtoExpert.new("dgproto.encrypted",    "DGProto Encrypted frame",   expert.group.PROTOCOL,  expert.severity.CHAT)
-local ef_error        = ProtoExpert.new("dgproto.error",        "DGProto Error/Close",       expert.group.PROTOCOL,  expert.severity.WARN)
-local ef_decrypt_ok   = ProtoExpert.new("dgproto.decrypt_ok",   "Decryption successful",     expert.group.DECRYPTION,expert.severity.CHAT)
-local ef_decrypt_fail = ProtoExpert.new("dgproto.decrypt_fail", "Decryption failed",         expert.group.DECRYPTION,expert.severity.WARN)
+local ef_handshake = ProtoExpert.new(
+    "dgproto.handshake", "DGProto Handshake",
+    expert.group.PROTOCOL, expert.severity.NOTE
+)
+local ef_encrypted = ProtoExpert.new(
+    "dgproto.encrypted", "DGProto Encrypted frame",
+    expert.group.PROTOCOL, expert.severity.CHAT
+)
+local ef_error = ProtoExpert.new(
+    "dgproto.error", "DGProto Error/Close",
+    expert.group.PROTOCOL, expert.severity.WARN
+)
+local ef_decrypt_ok = ProtoExpert.new(
+    "dgproto.decrypt_ok", "Decryption successful",
+    expert.group.DECRYPTION, expert.severity.CHAT
+)
+local ef_decrypt_fail = ProtoExpert.new(
+    "dgproto.decrypt_fail", "Decryption failed",
+    expert.group.DECRYPTION, expert.severity.WARN
+)
 dgproto.experts = { ef_handshake, ef_encrypted, ef_error, ef_decrypt_ok, ef_decrypt_fail }
 
 -- ── Constants ─────────────────────────────────────────────────────────────────
@@ -94,7 +113,6 @@ local NO_TAG = { [0x01]=true, [0x02]=true }
 -- keys[session_id_hex][direction][epoch] = key_hex
 local keylog_cache   = {}
 local keylog_keys    = {}   -- keylog_keys[sid] = { distinct key_hex values }
-local keylog_mtime   = nil
 local keylog_path_cached = nil
 
 local function bytes_to_hex(buf, offset, len)
@@ -164,17 +182,40 @@ local function ensure_keylog()
 end
 
 -- ── ChaCha20-Poly1305 decryption (pure Lua) ────────────────────────────────────
--- Pure-Lua ChaCha20-Poly1305 (RFC 8439). Wireshark 4.x ships Lua 5.3/5.4 with
--- native 64-bit integers and bitwise operators, so the whole AEAD runs
--- in-process: NO Python, NO subprocess, NO console windows, NO freezing.
--- The limb arithmetic below was verified against RFC 8439 and 300 random
--- vectors before being ported here; a self-test also runs at load time.
+-- Pure-Lua ChaCha20-Poly1305 (RFC 8439). Wireshark 4.2 embeds Lua 5.2,
+-- while newer builds may use Lua 5.3+. Keep the source parseable by Lua 5.2
+-- and route all 32-bit operations through bit32 (or LuaJIT's compatible bit
+-- module). The limb arithmetic below was verified against RFC 8439 and 300
+-- random vectors before being ported here; a self-test also runs at load time.
 
-local MASK32 = 0xFFFFFFFF
+local UINT32 = 4294967296
+local bits = bit32
+if not bits then
+    local ok, module = pcall(require, "bit32")
+    if ok then bits = module end
+end
+if not bits then
+    local ok, module = pcall(require, "bit")
+    if ok then bits = module end
+end
+assert(bits, "DGProto requires bit32 or a compatible bit module")
+
+local function u32(x) return x % UINT32 end
+local function band(...) return u32(bits.band(...)) end
+local function bor(...) return u32(bits.bor(...)) end
+local function bxor(...) return u32(bits.bxor(...)) end
+local function lshift(x, n)
+    if n >= 32 then return 0 end
+    return u32(bits.lshift(u32(x), n))
+end
+local function rshift(x, n)
+    if n >= 32 then return 0 end
+    return u32(bits.rshift(u32(x), n))
+end
+local function high_shift(x, n) return math.floor(x / (2 ^ n)) end
 
 local function rotl32(x, n)
-    x = x & MASK32
-    return ((x << n) | (x >> (32 - n))) & MASK32
+    return bor(lshift(x, n), rshift(x, 32 - n))
 end
 
 -- hex string -> byte array (1-indexed, with .n length)
@@ -198,7 +239,8 @@ end
 
 -- read a 32-bit little-endian word from byte array t at 1-based index i
 local function u32le(t, i)
-    return ((t[i] or 0) | ((t[i+1] or 0) << 8) | ((t[i+2] or 0) << 16) | ((t[i+3] or 0) << 24)) & MASK32
+    return bor(t[i] or 0, lshift(t[i+1] or 0, 8),
+        lshift(t[i+2] or 0, 16), lshift(t[i+3] or 0, 24))
 end
 
 -- ChaCha20 block -> 64 bytes (1-indexed)
@@ -206,17 +248,17 @@ local function chacha20_block(key, counter, nonce)
     local st = {}
     st[0] = 0x61707865; st[1] = 0x3320646e; st[2] = 0x79622d32; st[3] = 0x6b206574
     for j = 0, 7 do st[4 + j] = u32le(key, 1 + j * 4) end
-    st[12] = counter & MASK32
+    st[12] = u32(counter)
     for j = 0, 2 do st[13 + j] = u32le(nonce, 1 + j * 4) end
 
     local x = {}
     for i = 0, 15 do x[i] = st[i] end
 
     local function qr(a, b, c, d)
-        x[a] = (x[a] + x[b]) & MASK32; x[d] = x[d] ~ x[a]; x[d] = rotl32(x[d], 16)
-        x[c] = (x[c] + x[d]) & MASK32; x[b] = x[b] ~ x[c]; x[b] = rotl32(x[b], 12)
-        x[a] = (x[a] + x[b]) & MASK32; x[d] = x[d] ~ x[a]; x[d] = rotl32(x[d], 8)
-        x[c] = (x[c] + x[d]) & MASK32; x[b] = x[b] ~ x[c]; x[b] = rotl32(x[b], 7)
+        x[a] = u32(x[a] + x[b]); x[d] = bxor(x[d], x[a]); x[d] = rotl32(x[d], 16)
+        x[c] = u32(x[c] + x[d]); x[b] = bxor(x[b], x[c]); x[b] = rotl32(x[b], 12)
+        x[a] = u32(x[a] + x[b]); x[d] = bxor(x[d], x[a]); x[d] = rotl32(x[d], 8)
+        x[c] = u32(x[c] + x[d]); x[b] = bxor(x[b], x[c]); x[b] = rotl32(x[b], 7)
     end
 
     for _ = 1, 10 do
@@ -226,11 +268,11 @@ local function chacha20_block(key, counter, nonce)
 
     local out, p = {}, 0
     for i = 0, 15 do
-        local w = (x[i] + st[i]) & MASK32
-        out[p+1] =  w         & 0xff
-        out[p+2] = (w >> 8)   & 0xff
-        out[p+3] = (w >> 16)  & 0xff
-        out[p+4] = (w >> 24)  & 0xff
+        local w = u32(x[i] + st[i])
+        out[p+1] = band(w, 0xff)
+        out[p+2] = band(rshift(w, 8), 0xff)
+        out[p+3] = band(rshift(w, 16), 0xff)
+        out[p+4] = band(rshift(w, 24), 0xff)
         p = p + 4
     end
     return out
@@ -241,8 +283,8 @@ local function chacha20_xor(key, counter, nonce, data, dlen)
     local out, blk = {}, nil
     for i = 0, dlen - 1 do
         local j = i % 64
-        if j == 0 then blk = chacha20_block(key, counter + (i // 64), nonce) end
-        out[i + 1] = data[i + 1] ~ blk[j + 1]
+        if j == 0 then blk = chacha20_block(key, counter + math.floor(i / 64), nonce) end
+        out[i + 1] = bxor(data[i + 1], blk[j + 1])
     end
     out.n = dlen
     return out
@@ -250,83 +292,94 @@ end
 
 -- Poly1305 (RFC 8439), 26-bit limbs. msg: byte array, mlen bytes. key: 32 bytes.
 local function poly1305_mac(msg, mlen, key)
-    local t0, t1, t2, t3 = u32le(key,1), u32le(key,5), u32le(key,9), u32le(key,13)
-    local r0 =  t0                      & 0x3ffffff
-    local r1 = ((t0 >> 26) | (t1 << 6))  & 0x3ffff03
-    local r2 = ((t1 >> 20) | (t2 << 12)) & 0x3ffc0ff
-    local r3 = ((t2 >> 14) | (t3 << 18)) & 0x3f03fff
-    local r4 =  (t3 >> 8)                & 0x00fffff
-    local s1, s2, s3, s4 = r1*5, r2*5, r3*5, r4*5
+    -- Ten 13-bit limbs keep every product exact on Lua 5.2's double numbers.
+    local base13 = 8192
 
-    local h0,h1,h2,h3,h4 = 0,0,0,0,0
-    local i = 0
-    while i < mlen do
-        local rem = mlen - i
-        local b0,b1,b2,b3,hibit
-        if rem >= 16 then
-            b0 = u32le(msg,i+1); b1 = u32le(msg,i+5); b2 = u32le(msg,i+9); b3 = u32le(msg,i+13)
-            hibit = 1 << 24
-        else
-            local tmp = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0}
-            for k = 1, rem do tmp[k] = msg[i+k] end
-            tmp[rem+1] = 1
-            b0 = u32le(tmp,1); b1 = u32le(tmp,5); b2 = u32le(tmp,9); b3 = u32le(tmp,13)
-            hibit = 0
+    local function add_bit_value(limbs, bitpos, value)
+        local limb = math.floor(bitpos / 13)
+        local offset = bitpos % 13
+        limbs[limb] = (limbs[limb] or 0) + value * (2 ^ offset)
+        while limbs[limb] >= base13 do
+            local carry = math.floor(limbs[limb] / base13)
+            limbs[limb] = limbs[limb] % base13
+            limb = limb + 1
+            limbs[limb] = (limbs[limb] or 0) + carry
         end
-
-        h0 = h0 + ( b0                      & 0x3ffffff)
-        h1 = h1 + (((b0 >> 26) | (b1 << 6))  & 0x3ffffff)
-        h2 = h2 + (((b1 >> 20) | (b2 << 12)) & 0x3ffffff)
-        h3 = h3 + (((b2 >> 14) | (b3 << 18)) & 0x3ffffff)
-        h4 = h4 + ((b3 >> 8) | hibit)
-
-        local d0 = h0*r0 + h1*s4 + h2*s3 + h3*s2 + h4*s1
-        local d1 = h0*r1 + h1*r0 + h2*s4 + h3*s3 + h4*s2
-        local d2 = h0*r2 + h1*r1 + h2*r0 + h3*s4 + h4*s3
-        local d3 = h0*r3 + h1*r2 + h2*r1 + h3*r0 + h4*s4
-        local d4 = h0*r4 + h1*r3 + h2*r2 + h3*r1 + h4*r0
-
-        local c
-        c = d0 >> 26; h0 = d0 & 0x3ffffff
-        d1 = d1 + c; c = d1 >> 26; h1 = d1 & 0x3ffffff
-        d2 = d2 + c; c = d2 >> 26; h2 = d2 & 0x3ffffff
-        d3 = d3 + c; c = d3 >> 26; h3 = d3 & 0x3ffffff
-        d4 = d4 + c; c = d4 >> 26; h4 = d4 & 0x3ffffff
-        h0 = h0 + c*5; c = h0 >> 26; h0 = h0 & 0x3ffffff
-        h1 = h1 + c
-
-        i = i + 16
     end
 
-    local c
-    c = h1 >> 26; h1 = h1 & 0x3ffffff
-    h2 = h2 + c; c = h2 >> 26; h2 = h2 & 0x3ffffff
-    h3 = h3 + c; c = h3 >> 26; h3 = h3 & 0x3ffffff
-    h4 = h4 + c; c = h4 >> 26; h4 = h4 & 0x3ffffff
-    h0 = h0 + c*5; c = h0 >> 26; h0 = h0 & 0x3ffffff
-    h1 = h1 + c
-
-    local g0 = h0 + 5; c = g0 >> 26; g0 = g0 & 0x3ffffff
-    local g1 = h1 + c; c = g1 >> 26; g1 = g1 & 0x3ffffff
-    local g2 = h2 + c; c = g2 >> 26; g2 = g2 & 0x3ffffff
-    local g3 = h3 + c; c = g3 >> 26; g3 = g3 & 0x3ffffff
-    local g4 = h4 + c - (1 << 26)
-
-    if g4 >= 0 then
-        h0,h1,h2,h3,h4 = g0,g1,g2,g3,(g4 & 0x3ffffff)
+    local function bytes_to_limbs(bytes, count, append_one)
+        local limbs = {}
+        for i = 0, 9 do limbs[i] = 0 end
+        for i = 1, count do add_bit_value(limbs, (i - 1) * 8, bytes[i]) end
+        if append_one then add_bit_value(limbs, count * 8, 1) end
+        return limbs
     end
 
-    local f0 = ( h0        | (h1 << 26)) & MASK32
-    local f1 = ((h1 >> 6)  | (h2 << 20)) & MASK32
-    local f2 = ((h2 >> 12) | (h3 << 14)) & MASK32
-    local f3 = ((h3 >> 18) | (h4 << 8))  & MASK32
+    local rbytes = {}
+    for i = 1, 16 do rbytes[i] = key[i] end
+    rbytes[4] = band(rbytes[4], 15); rbytes[8] = band(rbytes[8], 15)
+    rbytes[12] = band(rbytes[12], 15); rbytes[16] = band(rbytes[16], 15)
+    rbytes[5] = band(rbytes[5], 252); rbytes[9] = band(rbytes[9], 252)
+    rbytes[13] = band(rbytes[13], 252)
+    local r = bytes_to_limbs(rbytes, 16, false)
+    local h = {}
+    for i = 0, 9 do h[i] = 0 end
 
-    local s0, sA, sB, sC = u32le(key,17), u32le(key,21), u32le(key,25), u32le(key,29)
-    local mac, acc = {}, 0
-    acc = f0 + s0;              mac[1]=acc&0xff; mac[2]=(acc>>8)&0xff; mac[3]=(acc>>16)&0xff; mac[4]=(acc>>24)&0xff
-    acc = f1 + sA + (acc >> 32);mac[5]=acc&0xff; mac[6]=(acc>>8)&0xff; mac[7]=(acc>>16)&0xff; mac[8]=(acc>>24)&0xff
-    acc = f2 + sB + (acc >> 32);mac[9]=acc&0xff; mac[10]=(acc>>8)&0xff;mac[11]=(acc>>16)&0xff;mac[12]=(acc>>24)&0xff
-    acc = f3 + sC + (acc >> 32);mac[13]=acc&0xff;mac[14]=(acc>>8)&0xff;mac[15]=(acc>>16)&0xff;mac[16]=(acc>>24)&0xff
+    local offset = 0
+    while offset < mlen do
+        local count = math.min(16, mlen - offset)
+        local block = {}
+        for i = 1, count do block[i] = msg[offset + i] end
+        local n = bytes_to_limbs(block, count, true)
+        for i = 0, 9 do h[i] = h[i] + n[i] end
+
+        local product = {}
+        for i = 0, 18 do product[i] = 0 end
+        for i = 0, 9 do
+            for j = 0, 9 do product[i + j] = product[i + j] + h[i] * r[j] end
+        end
+        for i = 18, 10, -1 do product[i - 10] = product[i - 10] + product[i] * 5 end
+        for _ = 1, 3 do
+            for i = 0, 9 do
+                local carry = math.floor(product[i] / base13)
+                product[i] = product[i] % base13
+                if i < 9 then
+                    product[i + 1] = product[i + 1] + carry
+                else
+                    product[0] = product[0] + carry * 5
+                end
+            end
+        end
+        for i = 0, 9 do h[i] = product[i] end
+        offset = offset + count
+    end
+
+    -- Canonicalize modulo 2^130-5 before adding the second half of the key.
+    local p_limbs = {8187,8191,8191,8191,8191,8191,8191,8191,8191,8191}
+    local ge_p = true
+    for i = 9, 0, -1 do
+        if h[i] ~= p_limbs[i + 1] then ge_p = h[i] > p_limbs[i + 1]; break end
+    end
+    if ge_p then
+        local borrow = 0
+        for i = 0, 9 do
+            local value = h[i] - p_limbs[i + 1] - borrow
+            if value < 0 then value = value + base13; borrow = 1 else borrow = 0 end
+            h[i] = value
+        end
+    end
+
+    local mac, carry = {}, 0
+    for byte_index = 0, 15 do
+        local bitpos = byte_index * 8
+        local limb = math.floor(bitpos / 13)
+        local shift = bitpos % 13
+        local value = math.floor(h[limb] / (2 ^ shift))
+        if shift > 5 and limb < 9 then value = value + h[limb + 1] * (2 ^ (13 - shift)) end
+        value = (value % 256) + key[17 + byte_index] + carry
+        mac[byte_index + 1] = value % 256
+        carry = math.floor(value / 256)
+    end
     return mac
 end
 
@@ -344,12 +397,12 @@ local function aead_decrypt(key, nonce, aad, aadlen, cttag, cttaglen)
     for _ = 1, pad16_len(aadlen) do mi = mi + 1; m[mi] = 0 end
     for k = 1, ctlen do mi = mi + 1; m[mi] = cttag[k] end
     for _ = 1, pad16_len(ctlen) do mi = mi + 1; m[mi] = 0 end
-    for k = 0, 7 do mi = mi + 1; m[mi] = (aadlen >> (8*k)) & 0xff end
-    for k = 0, 7 do mi = mi + 1; m[mi] = (ctlen  >> (8*k)) & 0xff end
+    for k = 0, 7 do mi = mi + 1; m[mi] = high_shift(aadlen, 8*k) % 256 end
+    for k = 0, 7 do mi = mi + 1; m[mi] = high_shift(ctlen, 8*k) % 256 end
 
     local tag = poly1305_mac(m, mi, otk)
     local diff = 0
-    for k = 1, 16 do diff = diff | (tag[k] ~ cttag[ctlen + k]) end
+    for k = 1, 16 do diff = bor(diff, bxor(tag[k], cttag[ctlen + k])) end
     if diff ~= 0 then return nil end  -- authentication failed
 
     return chacha20_xor(key, 1, nonce, cttag, ctlen), ctlen
@@ -425,44 +478,48 @@ local function sha256(msg, mlen)
     local bitlen = mlen * 8
     m[#m + 1] = 0x80
     while (#m % 64) ~= 56 do m[#m + 1] = 0 end
-    for i = 7, 0, -1 do m[#m + 1] = (bitlen >> (i * 8)) & 0xff end
+    for i = 7, 0, -1 do m[#m + 1] = high_shift(bitlen, i * 8) % 256 end
 
-    local function rotr(x, n) return ((x >> n) | (x << (32 - n))) & MASK32 end
+    local function rotr(x, n)
+        return bor(rshift(x, n), lshift(x, 32 - n))
+    end
 
     local W = {}
-    local nblocks = #m // 64
+    local nblocks = math.floor(#m / 64)
     for blk = 0, nblocks - 1 do
         local base = blk * 64
         for t = 0, 15 do
             local o = base + t * 4
-            W[t] = ((m[o+1] << 24) | (m[o+2] << 16) | (m[o+3] << 8) | m[o+4]) & MASK32
+            W[t] = bor(lshift(m[o+1], 24), lshift(m[o+2], 16),
+                lshift(m[o+3], 8), m[o+4])
         end
         for t = 16, 63 do
             local x15, x2 = W[t-15], W[t-2]
-            local s0 = rotr(x15,7)  ~ rotr(x15,18) ~ (x15 >> 3)
-            local s1 = rotr(x2,17)  ~ rotr(x2,19)  ~ (x2 >> 10)
-            W[t] = (W[t-16] + s0 + W[t-7] + s1) & MASK32
+            local s0 = bxor(rotr(x15,7), rotr(x15,18), rshift(x15,3))
+            local s1 = bxor(rotr(x2,17), rotr(x2,19), rshift(x2,10))
+            W[t] = u32(W[t-16] + s0 + W[t-7] + s1)
         end
         local a,b,c,d,e,g,h,i8 = H0,H1,H2,H3,H4,H5,H6,H7
         for t = 0, 63 do
-            local S1   = rotr(e,6) ~ rotr(e,11) ~ rotr(e,25)
-            local ch   = (e & g) ~ ((~e) & h)
-            local t1   = (i8 + S1 + ch + SHA_K[t+1] + W[t]) & MASK32
-            local S0   = rotr(a,2) ~ rotr(a,13) ~ rotr(a,22)
-            local maj  = (a & b) ~ (a & c) ~ (b & c)
-            local t2   = (S0 + maj) & MASK32
-            i8 = h; h = g; g = e; e = (d + t1) & MASK32
-            d = c; c = b; b = a; a = (t1 + t2) & MASK32
+            local S1   = bxor(rotr(e,6), rotr(e,11), rotr(e,25))
+            local ch   = bxor(band(e,g), band(bits.bnot(e),h))
+            local t1   = u32(i8 + S1 + ch + SHA_K[t+1] + W[t])
+            local S0   = bxor(rotr(a,2), rotr(a,13), rotr(a,22))
+            local maj  = bxor(band(a,b), band(a,c), band(b,c))
+            local t2   = u32(S0 + maj)
+            i8 = h; h = g; g = e; e = u32(d + t1)
+            d = c; c = b; b = a; a = u32(t1 + t2)
         end
-        H0=(H0+a)&MASK32; H1=(H1+b)&MASK32; H2=(H2+c)&MASK32; H3=(H3+d)&MASK32
-        H4=(H4+e)&MASK32; H5=(H5+g)&MASK32; H6=(H6+h)&MASK32; H7=(H7+i8)&MASK32
+        H0=u32(H0+a); H1=u32(H1+b); H2=u32(H2+c); H3=u32(H3+d)
+        H4=u32(H4+e); H5=u32(H5+g); H6=u32(H6+h); H7=u32(H7+i8)
     end
 
     local Hs = {H0,H1,H2,H3,H4,H5,H6,H7}
     local out, p = {}, 0
     for i = 1, 8 do
         local w = Hs[i]
-        out[p+1]=(w>>24)&0xff; out[p+2]=(w>>16)&0xff; out[p+3]=(w>>8)&0xff; out[p+4]=w&0xff
+        out[p+1]=band(rshift(w,24),0xff); out[p+2]=band(rshift(w,16),0xff)
+        out[p+3]=band(rshift(w,8),0xff); out[p+4]=band(w,0xff)
         p = p + 4
     end
     out.n = 32
@@ -480,11 +537,11 @@ local function hmac_sha256(key, klen, msg, mlen)
         for i = klen + 1, 64 do bkey[i] = 0 end
     end
     local inner = {}
-    for i = 1, 64 do inner[i] = bkey[i] ~ 0x36 end
+    for i = 1, 64 do inner[i] = bxor(bkey[i], 0x36) end
     for i = 1, mlen do inner[64 + i] = msg[i] end
     local ih = sha256(inner, 64 + mlen)
     local outer = {}
-    for i = 1, 64 do outer[i] = bkey[i] ~ 0x5c end
+    for i = 1, 64 do outer[i] = bxor(bkey[i], 0x5c) end
     for i = 1, 32 do outer[64 + i] = ih[i] end
     return sha256(outer, 96)  -- 32 bytes
 end
@@ -562,7 +619,7 @@ local function build_nonce_hex(buf, seq_offset)
 end
 
 -- ── Plaintext sub-dissection ──────────────────────────────────────────────────
-local function dissect_plaintext(pt_tvb, msg_type, tree, pinfo)
+local function dissect_plaintext(pt_tvb, msg_type, tree)
     if msg_type == 0x03 then  -- EncryptedData
         if pt_tvb:len() < 4 then return end
         tree:add_le(f.stream_id,    pt_tvb(0, 2))
@@ -751,7 +808,7 @@ local function dissect_one(buf, pinfo, tree, offset)
                 local pt_tvb = hex_to_tvb(pt_hex, "Plaintext")
                 local dec_tree = proto_tree:add(dgproto, pt_tvb(), "Decrypted Payload")
                 dec_tree:add(f.plaintext, pt_tvb())
-                dissect_plaintext(pt_tvb, msg_type, dec_tree, pinfo)
+                dissect_plaintext(pt_tvb, msg_type, dec_tree)
                 proto_tree:add_proto_expert_info(ef_decrypt_ok)
 
                 -- Enrich info column for EncryptedData
@@ -764,7 +821,12 @@ local function dissect_one(buf, pinfo, tree, offset)
                     pinfo.cols.info:append(new_info .. "  ")
                 end
             else
-                local reason = (pt_hex == "AUTH_FAIL") and "auth tag mismatch (wrong key / nonce / AAD)" or "decryption failed (crypto self-test?)"
+                local reason
+                if pt_hex == "AUTH_FAIL" then
+                    reason = "auth tag mismatch (wrong key / nonce / AAD)"
+                else
+                    reason = "decryption failed (crypto self-test?)"
+                end
                 proto_tree:add_proto_expert_info(ef_decrypt_fail, reason)
             end
         else
@@ -820,6 +882,5 @@ dgproto:register_heuristic("tcp", heuristic_dissect)
 function dgproto.init()
     keylog_cache = {}
     keylog_keys = {}
-    keylog_mtime = nil
     keylog_path_cached = nil
 end
