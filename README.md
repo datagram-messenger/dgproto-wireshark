@@ -2,9 +2,9 @@
 
 [![CI](https://github.com/datagram-messenger/dgproto-wireshark/actions/workflows/ci.yml/badge.svg)](https://github.com/datagram-messenger/dgproto-wireshark/actions/workflows/ci.yml)
 
-A standalone Wireshark Lua dissector for the current **DGProto v1 MVP** wire format.
+A standalone Wireshark Lua dissector for the current **DGProto v1 draft** wire format.
 
-> **Status:** MVP / implementation-track. The dissector is suitable for local protocol development and debugging. DGProto v1 is still a draft and wire compatibility is not yet guaranteed across draft revisions.
+> **Status:** pre-1.0 / implementation-track. Releases in the `0.x` series follow the evolving DGProto v1 draft and may contain breaking wire-interpretation or display-filter changes. Version `1.0.0` will be the first stable release and will require a stabilized DGProto v1 wire contract plus interoperability validation.
 
 ## Features
 
@@ -13,7 +13,7 @@ The implementation currently provides:
 - DGProto discovery by TCP port (default `9900`), heuristic detection using the `DGP1` magic, and **Decode As…** support;
 - TCP stream reassembly for split frames and multiple frames in one segment;
 - the 40-byte little-endian header, payload, 16-byte data-frame AEAD tag, and optional padding;
-- handshake recognition, including the tagless third Noise XX flight carried as type `0x03` with a zero session ID;
+- handshake sub-dissection for all three Noise XX flights, including the canonical tagless third flight carried as type `0x02`;
 - payload fields for encrypted data, ping/pong, session close, acknowledgements, rekey initiation, and errors;
 - optional keylog-assisted ChaCha20-Poly1305 decryption implemented entirely inside the Lua plugin;
 - forward key-ratchet derivation from epoch-1 keylog entries; and
@@ -25,7 +25,7 @@ No Python runtime or external decryption helper is used by the plugin.
 
 - Wireshark 4.x with Lua enabled;
 - Lua with 64-bit integer and native bitwise support (the normal Lua runtime in supported Wireshark 4.x builds); and
-- DGProto v1 over TCP as implemented by the current MVP.
+- DGProto v1 over TCP as implemented by the current draft profile.
 
 The project is checked in CI on Ubuntu with Lua 5.3, `luacheck`, and `tshark`. Windows and macOS Wireshark installations use the same single Lua file, but are not yet exercised by this repository's CI matrix.
 
@@ -99,10 +99,16 @@ dgproto.error_code
 dgproto.decrypt_fail
 ```
 
+## Compatibility and stability
+
+- `0.x` releases are pre-stable: breaking interpretation and display-filter changes may ship in a minor release when the DGProto v1 draft changes.
+- `1.0.0` is reserved for the first stable release. It requires a frozen DGProto v1 wire contract, cross-implementation wire-vector/pcap validation, and documented compatibility expectations.
+- After `1.0.0`, incompatible public display-filter or supported-wire changes require a new major release; compatible fields and protocol coverage may be added in minor releases.
+
 ## Limitations
 
-- The dissector follows the current DGProto MVP, not historical or proposed post-MVP profiles.
-- Noise handshake payloads are identified and displayed as bytes; the Noise handshake itself is not decrypted or dissected internally.
+- The dissector follows the current DGProto draft profile, not historical or proposed future profiles.
+- Noise handshake envelopes and public fields are dissected, but encrypted Noise handshake payloads are not decrypted internally.
 - Application TLVs are exposed as bytes rather than decoded into every application-specific schema.
 - Keylog direction labels are not used to infer capture direction; authenticated trial decryption selects a key.
 - Forward ratchet search is bounded to keep packet redissection responsive.
@@ -124,31 +130,30 @@ sudo apt-get install lua5.3 lua-check tshark
 make check LUA=lua5.3 LUAC=luac5.3
 
 # Build a local deterministic package and checksum
-make package LUA=lua5.3 LUAC=luac5.3 VERSION=0.1.0
+make package LUA=lua5.3 LUAC=luac5.3 VERSION=0.3.0
 ```
 
 If `tshark` is unavailable, `scripts/validate.py` reports that integration step as skipped; CI requires and runs it. `luac -p` and `luacheck` remain required by `make check`.
 
 ## Release artifacts
 
-Pushing a stable SemVer tag such as `v0.1.0` runs validation and creates (but does not automatically publish) a retained workflow artifact:
+Pushing a stable SemVer tag such as `v0.3.0` runs validation, builds the deterministic package and checksum, and publishes a GitHub Release containing:
 
 ```text
-dgproto-wireshark-v0.1.0/
-├── dgproto-wireshark-0.1.0.zip
-└── dgproto-wireshark-0.1.0.zip.sha256
+dgproto-wireshark-0.3.0.zip
+dgproto-wireshark-0.3.0.zip.sha256
 ```
 
 The ZIP has one top-level directory and contains exactly:
 
 ```text
-dgproto-wireshark-0.1.0/
+dgproto-wireshark-0.3.0/
 ├── dgproto.lua
 ├── README.md
 └── LICENSE
 ```
 
-Verify it with `sha256sum --check dgproto-wireshark-0.1.0.zip.sha256` before distribution.
+Verify it with `sha256sum --check dgproto-wireshark-0.3.0.zip.sha256` before distribution.
 
 ## License
 

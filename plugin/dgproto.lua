@@ -63,7 +63,7 @@ f.key_confirm    = ProtoField.bytes  ("dgproto.key_confirm",     "KeyConfirm")
 f.error_code     = ProtoField.uint16 ("dgproto.error_code",      "ErrorCode",       base.DEC)
 f.error_context  = ProtoField.string ("dgproto.error_context",   "Context",         base.UNICODE)
 
--- Handshake (0x01, 0x02, HandshakeFinish 0x03/session_zero)
+-- Handshake (0x01, 0x02; flight 3 is 0x02 with a 64-byte payload)
 f.hs_pattern      = ProtoField.uint8  ("dgproto.hs.pattern",      "NoisePattern",    base.HEX,
                         {[0x01]="Noise_XX_25519_ChaChaPoly_SHA256"})
 f.hs_reserved     = ProtoField.bytes  ("dgproto.hs.reserved",     "Reserved")
@@ -705,16 +705,11 @@ local function dissect_one(buf, pinfo, tree, offset)
     local payload_len= buf(offset + 32, 4):le_uint()
     local pad_len    = buf(offset + 36, 1):uint()
 
-    -- HandshakeFinish (Noise message 3) reuses msg_type 0x03 but is sent with an
-    -- all-zero session ID *before* a session is established. Unlike EncryptedData
-    -- (also 0x03) it carries NO AEAD tag and must not be decrypted.
-    local session_zero = true
-    for i = 0, 15 do
-        if buf(offset + 8 + i, 1):uint() ~= 0 then session_zero = false; break end
-    end
-    local is_handshake_finish = (msg_type == 0x03) and session_zero
+    -- Both the second and third Noise XX flights use the canonical 0x02
+    -- handshake envelope. Their fixed payload lengths distinguish them.
+    local is_handshake_finish = (msg_type == 0x02) and (payload_len == 64)
 
-    local has_tag    = (not NO_TAG[msg_type]) and (not is_handshake_finish)
+    local has_tag    = not NO_TAG[msg_type]
     local tag_len    = has_tag and AEAD_TAG_LEN or 0
 
     local total_len  = HEADER_LEN + payload_len + tag_len + pad_len
@@ -765,13 +760,13 @@ local function dissect_one(buf, pinfo, tree, offset)
         hs_tree:add(f.hs_pattern,      buf(offset + HEADER_LEN,      1))
         hs_tree:add(f.hs_reserved,     buf(offset + HEADER_LEN +  1, 3))
         hs_tree:add(f.hs_client_ephem, buf(offset + HEADER_LEN +  4, 32))
+    elseif is_handshake_finish then
+        local hs_tree = proto_tree:add(dgproto, buf(offset + HEADER_LEN, payload_len), "HandshakeFinish")
+        hs_tree:add(f.hs_noise_payload, buf(offset + HEADER_LEN, 64))
     elseif msg_type == 0x02 and payload_len >= 96 then
         local hs_tree = proto_tree:add(dgproto, buf(offset + HEADER_LEN, payload_len), "HandshakeResponse")
         hs_tree:add(f.hs_server_ephem,  buf(offset + HEADER_LEN,      32))
         hs_tree:add(f.hs_noise_payload, buf(offset + HEADER_LEN + 32, 64))
-    elseif is_handshake_finish and payload_len >= 64 then
-        local hs_tree = proto_tree:add(dgproto, buf(offset + HEADER_LEN, payload_len), "HandshakeFinish")
-        hs_tree:add(f.hs_noise_payload, buf(offset + HEADER_LEN, 64))
     end
 
     -- ── Expert info & column ───────────────────────────────────────────────
@@ -779,11 +774,11 @@ local function dissect_one(buf, pinfo, tree, offset)
     local seq_val  = buf(offset + 24, 8):le_uint64()
 
     local info_str
-    if msg_type == 0x01 or msg_type == 0x02 then
-        info_str = string.format("[%s]", msg_name)
-        proto_tree:add_proto_expert_info(ef_handshake)
-    elseif is_handshake_finish then
+    if is_handshake_finish then
         info_str = "[HandshakeFinish]"
+        proto_tree:add_proto_expert_info(ef_handshake)
+    elseif msg_type == 0x01 or msg_type == 0x02 then
+        info_str = string.format("[%s]", msg_name)
         proto_tree:add_proto_expert_info(ef_handshake)
     elseif msg_type == 0x03 then
         info_str = string.format("[EncryptedData seq=%s]", tostring(seq_val))

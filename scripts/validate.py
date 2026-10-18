@@ -32,6 +32,8 @@ REQUIRED_SNIPPETS = (
     'HandshakeFinish',
     # Ack individual sequences (v0.2.0)
     'acked_seq_entry',
+    # Canonical Noise XX third-flight envelope (v0.3.0)
+    'local is_handshake_finish = (msg_type == 0x02) and (payload_len == 64)',
 )
 FORBIDDEN_SNIPPETS = (
     "dgproto_decrypt.py",
