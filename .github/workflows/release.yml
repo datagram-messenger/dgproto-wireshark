@@ -39,7 +39,7 @@ jobs:
         run: |
           archive="dist/dgproto-wireshark-${GITHUB_REF_NAME#v}.zip"
           python -m zipfile --list "$archive"
-          sha256sum --check "$archive.sha256"
+          (cd dist && sha256sum --check "$(basename "$archive.sha256")")
           test "$(python -c 'import sys,zipfile; print(len(zipfile.ZipFile(sys.argv[1]).namelist()))' "$archive")" = 3
 
       - name: Retain package as workflow artifact

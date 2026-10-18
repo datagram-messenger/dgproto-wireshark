@@ -33,4 +33,4 @@ jobs:
         run: |
           make package LUA=lua5.3 LUAC=luac5.3 VERSION=0.0.0
           python -m zipfile --list dist/dgproto-wireshark-0.0.0.zip
-          sha256sum --check dist/dgproto-wireshark-0.0.0.zip.sha256
+          (cd dist && sha256sum --check dgproto-wireshark-0.0.0.zip.sha256)
