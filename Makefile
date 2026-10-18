@@ -1,4 +1,4 @@
-.PHONY: check syntax lint selftest package clean
+.PHONY: check syntax lint selftest fixtures package clean
 
 LUA ?= lua
 LUAC ?= luac
@@ -7,7 +7,7 @@ TSHARK ?= tshark
 PYTHON ?= python3
 VERSION ?= dev
 
-check: syntax lint selftest
+check: syntax lint selftest fixtures
 
 syntax:
 	$(LUAC) -p plugin/dgproto.lua
@@ -17,6 +17,9 @@ lint:
 
 selftest:
 	$(PYTHON) scripts/validate.py --plugin plugin/dgproto.lua --tshark "$(TSHARK)"
+
+fixtures:
+	$(PYTHON) tests/run_fixtures.py --plugin plugin/dgproto.lua --tshark "$(TSHARK)"
 
 package: check
 	$(PYTHON) scripts/package_release.py --version "$(VERSION)" --output-dir dist

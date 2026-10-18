@@ -13,7 +13,7 @@ concurrency:
 
 jobs:
   validate:
-    name: Syntax, lint, and Wireshark self-test
+    name: Syntax, lint, self-test, and protocol fixtures
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
@@ -26,7 +26,7 @@ jobs:
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y lua5.3 lua-check tshark
 
-      - name: Validate
+      - name: Validate (syntax, lint, self-test, fixtures)
         run: make check LUA=lua5.3 LUAC=luac5.3
 
       - name: Verify deterministic package assembly

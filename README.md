@@ -141,14 +141,38 @@ This project inspects DGProto; it does not define it. The [DGProto v1 specificat
 # Ubuntu/Debian
 sudo apt-get install lua5.3 lua-check tshark
 
-# Syntax, lint, static validation, and tshark self-test
+# Syntax, lint, static validation, tshark self-test, and protocol fixtures
 make check LUA=lua5.3 LUAC=luac5.3
+
+# Protocol dissection fixtures only (generate a synthetic capture, run tshark)
+make fixtures
 
 # Deterministic release archive and SHA-256 checksum
 make package LUA=lua5.3 LUAC=luac5.3 VERSION=0.3.0
 ```
 
 Python is used only by repository validation and packaging scripts, never by the plugin at runtime. CI installs `tshark` and runs the complete validation suite.
+
+### Validation fixtures
+
+`tests/run_fixtures.py` drives the dissector against synthetic DGProto traffic to
+keep decoding reproducible and catch field-layout regressions. `tests/fixtures/make_fixtures.py`
+deterministically generates a libpcap capture, a matching keylog, and the expected
+displayed-field values; the runner loads the plugin in `tshark`, extracts `-T fields`,
+and asserts the results. The fixtures cover:
+
+- all three Noise XX handshake flights;
+- encrypted data and every control message type, decrypted via the keylog;
+- padded frames, frames fragmented across TCP segments, and multiple frames coalesced
+  into one segment;
+- malformed, truncated, and unknown frames, which must fail safely without crashing,
+  over-reading, or dissecting foreign traffic.
+
+Captures and keylogs are regenerated on every run (under the ignored `build/` directory)
+rather than committed, and contain only synthetic, public material — no real traffic or
+secrets. The generator's ChaCha20-Poly1305 is checked against the RFC 8439 known-answer
+vector so generated frames decrypt under the dissector. If `tshark` is not installed the
+field checks are skipped, so run them in CI for full coverage.
 
 ## Releases
 
