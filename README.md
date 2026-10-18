@@ -1,159 +1,169 @@
-# DGProto Wireshark dissector
+<div align="center">
+
+# DGProto for Wireshark
+
+**A standalone Wireshark dissector for the DGProto v1 draft wire format.**
 
 [![CI](https://github.com/datagram-messenger/dgproto-wireshark/actions/workflows/ci.yml/badge.svg)](https://github.com/datagram-messenger/dgproto-wireshark/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/datagram-messenger/dgproto-wireshark)](https://github.com/datagram-messenger/dgproto-wireshark/releases/latest)
+[![Wireshark](https://img.shields.io/badge/Wireshark-4.x-1679A7?logo=wireshark&logoColor=white)](https://www.wireshark.org/)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-A standalone Wireshark Lua dissector for the current **DGProto v1 draft** wire format.
+[Install](#installation) · [Configure](#configuration) · [Decrypt](#keylog-decryption) · [Develop](#development)
 
-> **Status:** pre-1.0 / implementation-track. Releases in the `0.x` series follow the evolving DGProto v1 draft and may contain breaking wire-interpretation or display-filter changes. Version `1.0.0` will be the first stable release and will require a stabilized DGProto v1 wire contract plus interoperability validation.
+</div>
+
+---
+
+## Overview
+
+DGProto for Wireshark is a single-file Lua dissector for inspecting DGProto v1 traffic. It supports stream reassembly, Noise XX handshake inspection, encrypted frame metadata, control messages, and optional authenticated payload decryption from local keylogs.
+
+> [!IMPORTANT]
+> Releases before `1.0.0` track the evolving DGProto v1 draft and may include breaking protocol or display-filter changes. Version `1.0.0` is reserved for the first stable release.
 
 ## Features
 
-The implementation currently provides:
+- Discovery by TCP port `9900`, `DGP1` heuristic detection, and **Decode As…**
+- TCP reassembly for fragmented and coalesced frames
+- Fixed-header, payload, AEAD tag, and padding inspection
+- Sub-dissection of all three Noise XX handshake flights
+- Encrypted data, ping/pong, close, acknowledgement, rekey, and error fields
+- Optional ChaCha20-Poly1305 decryption from DGProto keylogs
+- Forward traffic-key ratchet derivation from epoch 1
+- Built-in RFC 8439 and RFC 4231 cryptographic self-tests
 
-- DGProto discovery by TCP port (default `9900`), heuristic detection using the `DGP1` magic, and **Decode As…** support;
-- TCP stream reassembly for split frames and multiple frames in one segment;
-- the 40-byte little-endian header, payload, 16-byte data-frame AEAD tag, and optional padding;
-- handshake sub-dissection for all three Noise XX flights, including the canonical tagless third flight carried as type `0x02`;
-- payload fields for encrypted data, ping/pong, session close, acknowledgements, rekey initiation, and errors;
-- optional keylog-assisted ChaCha20-Poly1305 decryption implemented entirely inside the Lua plugin;
-- forward key-ratchet derivation from epoch-1 keylog entries; and
-- load-time RFC 8439 ChaCha20-Poly1305 and RFC 4231 HMAC-SHA256 known-answer tests.
+The runtime is self-contained: no Python process or external decryption helper is required.
 
-No Python runtime or external decryption helper is used by the plugin.
+## Requirements
 
-## Supported environment
-
-- Wireshark 4.x with Lua enabled;
-- Lua with 64-bit integer and native bitwise support (the normal Lua runtime in supported Wireshark 4.x builds); and
-- DGProto v1 over TCP as implemented by the current draft profile.
-
-The project is checked in CI on Ubuntu with Lua 5.3, `luacheck`, and `tshark`. Windows and macOS Wireshark installations use the same single Lua file, but are not yet exercised by this repository's CI matrix.
+- Wireshark 4.x with Lua enabled
+- A standard Wireshark Lua runtime with 64-bit integers and native bitwise operations
+- DGProto v1 traffic using the current draft profile over TCP
 
 ## Installation
 
-Download a release archive or copy [`plugin/dgproto.lua`](plugin/dgproto.lua) from a trusted revision into Wireshark's **Personal Lua Plugins** directory.
+1. Download the latest archive from [GitHub Releases](https://github.com/datagram-messenger/dgproto-wireshark/releases/latest).
+2. Extract `dgproto.lua` into Wireshark's **Personal Lua Plugins** directory.
+3. Select **Analyze → Reload Lua Plugins**, or restart Wireshark.
 
-Find the exact directory under **Help → About Wireshark → Folders**. Common locations are:
+Find the exact plugin directory under **Help → About Wireshark → Folders**. Common locations:
 
-- Windows: `%APPDATA%\Wireshark\plugins`
-- Linux: `~/.local/lib/wireshark/plugins`
-- macOS: `~/.local/lib/wireshark/plugins`
+| Platform | Personal Lua Plugins directory |
+| --- | --- |
+| Windows | `%APPDATA%\Wireshark\plugins` |
+| Linux | `~/.local/lib/wireshark/plugins` |
+| macOS | `~/.local/lib/wireshark/plugins` |
 
-Then choose **Analyze → Reload Lua Plugins** or restart Wireshark. For a one-off launch:
+For a one-off launch:
 
 ```sh
 wireshark -X lua_script:/absolute/path/to/dgproto.lua
 ```
 
-If Lua loading is disabled by local policy, enable it before using the plugin.
+## Configuration
 
-## Preferences and configuration
-
-Open **Edit → Preferences → Protocols → DGProto v1**:
+Open **Edit → Preferences → Protocols → DGProto v1**.
 
 | Preference | Default | Purpose |
 | --- | --- | --- |
-| `TCP Port` | `9900` | TCP port registered for DGProto traffic. |
-| `Keylog File` | empty | Explicit keylog path; overrides `DGPROTO_KEYLOG`. |
+| `TCP Port` | `9900` | Port registered for DGProto traffic |
+| `Keylog File` | empty | Keylog path; overrides `DGPROTO_KEYLOG` |
 
-For traffic on another port, change the preference or select a packet and use **Analyze → Decode As…**.
+For traffic on another port, update `TCP Port` or use **Analyze → Decode As…**.
 
-The keylog lookup order is:
+Keylogs are resolved in this order:
 
-1. the `Keylog File` preference;
-2. the `DGPROTO_KEYLOG` environment variable; and
-3. `%APPDATA%\Wireshark\dgproto_keylog.txt` on Windows.
+1. `Keylog File` preference
+2. `DGPROTO_KEYLOG` environment variable
+3. `%APPDATA%\Wireshark\dgproto_keylog.txt` on Windows
 
 ## Keylog decryption
 
-Set `DGPROTO_KEYLOG` for a local DGProto process before establishing a session. The Go reference implementation writes entries in this format:
+Set `DGPROTO_KEYLOG` before starting a local DGProto process and establishing a session. Expected entries:
 
 ```text
 DGPROTO_SESSION_KEY <32-hex-session-id> <send|recv> 1 <64-hex-key>
 ```
 
-The plugin tries each key recorded for the session and accepts only a key that verifies the Poly1305 tag. It derives later traffic-key epochs from an epoch-1 key when needed. The frame nonce is `00000000 || LE64(sequence)` and authenticated data is the complete 40-byte header followed by padding, matching the protocol reference.
+The dissector tries available session keys and accepts plaintext only after Poly1305 authentication succeeds. It can derive later traffic-key epochs from an epoch-1 entry.
 
-> **Secret warning:** keylogs contain live session traffic keys and remove transport confidentiality. Generate them only in controlled local debugging environments. Never use key logging in production, share a keylog, commit one, attach one to an issue, or include one in an artifact. Delete keylogs securely when debugging is complete.
+> [!CAUTION]
+> Keylogs contain live traffic keys and remove transport confidentiality. Use them only in controlled development environments. Never commit, publish, attach, or use production keylogs. Delete them after debugging.
 
-After adding keys, redisplay or reopen the capture. Successful decryption adds a **Decrypted Payload** subtree; authentication failures appear as expert information and never expose unauthenticated plaintext.
+Reload or reopen the capture after adding keys. Successful decryption adds a **Decrypted Payload** subtree; failures appear in Expert Information without exposing unauthenticated plaintext.
 
 ## Usage
 
 1. Start a capture or open a trusted capture.
-2. Confirm the **Protocol** column shows `DGProto`.
-3. Expand **DGProto v1 → Header** to inspect framing and sequence information.
-4. Configure a keylog if decrypted application/control fields are required.
-5. Use **Analyze → Expert Information** to review handshake, encryption, decryption, and protocol warnings.
+2. Confirm that the **Protocol** column shows `DGProto`.
+3. Expand **DGProto v1 → Header** to inspect framing and sequence data.
+4. Add a keylog when decrypted fields are needed.
+5. Open **Analyze → Expert Information** to review protocol and decryption warnings.
 
-Useful display filters include:
+### Display filters
 
-```text
-dgproto
-dgproto.msg_type == 0x03
-dgproto.session_id == 00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff
-dgproto.sequence >= 100
-dgproto.stream_id == 1
-dgproto.flags.padding == 1
-dgproto.error_code
-dgproto.decrypt_fail
-```
+| Goal | Filter |
+| --- | --- |
+| All DGProto traffic | `dgproto` |
+| Encrypted data frames | `dgproto.msg_type == 0x03` |
+| A specific session | `dgproto.session_id == 00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff` |
+| Sequence number range | `dgproto.sequence >= 100` |
+| A logical stream | `dgproto.stream_id == 1` |
+| Padded frames | `dgproto.flags.padding == 1` |
+| Protocol errors | `dgproto.error_code` |
+| Decryption failures | `dgproto.decrypt_fail` |
 
-## Compatibility and stability
+## Compatibility
 
-- `0.x` releases are pre-stable: breaking interpretation and display-filter changes may ship in a minor release when the DGProto v1 draft changes.
-- `1.0.0` is reserved for the first stable release. It requires a frozen DGProto v1 wire contract, cross-implementation wire-vector/pcap validation, and documented compatibility expectations.
-- After `1.0.0`, incompatible public display-filter or supported-wire changes require a new major release; compatible fields and protocol coverage may be added in minor releases.
+| Release | Stability policy |
+| --- | --- |
+| `0.x` | Draft-tracking; minor releases may contain breaking protocol or filter changes |
+| `1.0.0` | First stable release after wire-contract freeze and interoperability validation |
+| `1.x+` | Incompatible public changes require a new major version |
 
-## Limitations
+## Known limitations
 
-- The dissector follows the current DGProto draft profile, not historical or proposed future profiles.
-- Noise handshake envelopes and public fields are dissected, but encrypted Noise handshake payloads are not decrypted internally.
-- Application TLVs are exposed as bytes rather than decoded into every application-specific schema.
-- Keylog direction labels are not used to infer capture direction; authenticated trial decryption selects a key.
-- Forward ratchet search is bounded to keep packet redissection responsive.
-- There is no automated cross-platform GUI test matrix yet.
+- Historical and proposed future DGProto profiles are not supported.
+- Encrypted Noise handshake payloads are not decrypted.
+- Application-specific TLV schemas remain raw bytes.
+- Authenticated trial decryption selects the matching key; keylog direction labels do not determine capture direction.
+- Forward ratchet search is bounded to keep redissection responsive.
+- Automated GUI testing is not yet cross-platform.
 
-## Protocol relationship and source of truth
+## Protocol source of truth
 
-This repository is a diagnostic consumer of DGProto; it does not define the protocol. The normative implementation-track specification and reference behavior live in [`datagram-messenger/dgproto-go`](https://github.com/datagram-messenger/dgproto-go), especially `docs/protocol/dgproto-v1.md`, framing/crypto code, keylog format, and wire-vector tests. Changes here should follow that source rather than introduce a new wire interpretation.
+This project inspects DGProto; it does not define it. The [DGProto v1 specification](https://github.com/datagram-messenger/dgproto-go/blob/main/docs/protocol/dgproto-v1.md), reference implementation, keylog format, and wire vectors in [`dgproto-go`](https://github.com/datagram-messenger/dgproto-go) are authoritative.
 
 ## Development
 
-The validation toolchain uses Python only for repository checks and deterministic packaging, not at plugin runtime.
-
 ```sh
-# Ubuntu/Debian prerequisites
+# Ubuntu/Debian
 sudo apt-get install lua5.3 lua-check tshark
 
-# Syntax, lint, static checks, and tshark load-time crypto self-test
+# Syntax, lint, static validation, and tshark self-test
 make check LUA=lua5.3 LUAC=luac5.3
 
-# Build a local deterministic package and checksum
+# Deterministic release archive and SHA-256 checksum
 make package LUA=lua5.3 LUAC=luac5.3 VERSION=0.3.0
 ```
 
-If `tshark` is unavailable, `scripts/validate.py` reports that integration step as skipped; CI requires and runs it. `luac -p` and `luacheck` remain required by `make check`.
+Python is used only by repository validation and packaging scripts, never by the plugin at runtime. CI installs `tshark` and runs the complete validation suite.
 
-## Release artifacts
+## Releases
 
-Pushing a stable SemVer tag such as `v0.3.0` runs validation, builds the deterministic package and checksum, and publishes a GitHub Release containing:
+Pushing a stable SemVer tag such as `v0.3.0` validates the project and publishes:
 
 ```text
 dgproto-wireshark-0.3.0.zip
 dgproto-wireshark-0.3.0.zip.sha256
 ```
 
-The ZIP has one top-level directory and contains exactly:
+The archive contains `dgproto.lua`, this README, and the license under one versioned directory. Verify a downloaded archive with:
 
-```text
-dgproto-wireshark-0.3.0/
-├── dgproto.lua
-├── README.md
-└── LICENSE
+```sh
+sha256sum --check dgproto-wireshark-0.3.0.zip.sha256
 ```
-
-Verify it with `sha256sum --check dgproto-wireshark-0.3.0.zip.sha256` before distribution.
 
 ## License
 
