@@ -63,6 +63,17 @@ f.key_confirm    = ProtoField.bytes  ("dgproto.key_confirm",     "KeyConfirm")
 f.error_code     = ProtoField.uint16 ("dgproto.error_code",      "ErrorCode",       base.DEC)
 f.error_context  = ProtoField.string ("dgproto.error_context",   "Context",         base.UNICODE)
 
+-- Handshake (0x01, 0x02, HandshakeFinish 0x03/session_zero)
+f.hs_pattern      = ProtoField.uint8  ("dgproto.hs.pattern",      "NoisePattern",    base.HEX,
+                        {[0x01]="Noise_XX_25519_ChaChaPoly_SHA256"})
+f.hs_reserved     = ProtoField.bytes  ("dgproto.hs.reserved",     "Reserved")
+f.hs_client_ephem = ProtoField.bytes  ("dgproto.hs.client_ephem", "ClientEphemeral (X25519)")
+f.hs_server_ephem = ProtoField.bytes  ("dgproto.hs.server_ephem", "ServerEphemeral (X25519)")
+f.hs_noise_payload= ProtoField.bytes  ("dgproto.hs.noise_payload","NoisePayload")
+
+-- Ack (individual sequence entries)
+f.acked_seq_entry = ProtoField.uint64 ("dgproto.acked_seq",       "AckedSeq",        base.DEC)
+
 -- Expert info
 -- NOTE: expert.group.* / expert.severity.* live in the GLOBAL `expert` table.
 -- Do not shadow it with `local expert = dgproto.experts` — that makes
@@ -646,7 +657,9 @@ local function dissect_plaintext(pt_tvb, msg_type, tree)
         local count = pt_tvb(0,1):uint()
         tree:add(f.acked_count, pt_tvb(0, 1))
         if pt_tvb:len() >= 1 + count * 8 then
-            tree:add(f.acked_seqs, pt_tvb(1, count * 8))
+            for i = 0, count - 1 do
+                tree:add_le(f.acked_seq_entry, pt_tvb(1 + i * 8, 8))
+            end
         end
 
     elseif msg_type == 0x08 then  -- RekeyInit
@@ -746,6 +759,21 @@ local function dissect_one(buf, pinfo, tree, offset)
         proto_tree:add(f.padding, buf(offset + HEADER_LEN + payload_len + tag_len, pad_len))
     end
 
+    -- ── Handshake payload sub-dissection ──────────────────────────────────
+    if msg_type == 0x01 and payload_len >= 36 then
+        local hs_tree = proto_tree:add(dgproto, buf(offset + HEADER_LEN, payload_len), "HandshakeInit")
+        hs_tree:add(f.hs_pattern,      buf(offset + HEADER_LEN,      1))
+        hs_tree:add(f.hs_reserved,     buf(offset + HEADER_LEN +  1, 3))
+        hs_tree:add(f.hs_client_ephem, buf(offset + HEADER_LEN +  4, 32))
+    elseif msg_type == 0x02 and payload_len >= 96 then
+        local hs_tree = proto_tree:add(dgproto, buf(offset + HEADER_LEN, payload_len), "HandshakeResponse")
+        hs_tree:add(f.hs_server_ephem,  buf(offset + HEADER_LEN,      32))
+        hs_tree:add(f.hs_noise_payload, buf(offset + HEADER_LEN + 32, 64))
+    elseif is_handshake_finish and payload_len >= 64 then
+        local hs_tree = proto_tree:add(dgproto, buf(offset + HEADER_LEN, payload_len), "HandshakeFinish")
+        hs_tree:add(f.hs_noise_payload, buf(offset + HEADER_LEN, 64))
+    end
+
     -- ── Expert info & column ───────────────────────────────────────────────
     local msg_name = MSG_NAMES[msg_type] or string.format("Unknown(0x%02x)", msg_type)
     local seq_val  = buf(offset + 24, 8):le_uint64()
@@ -772,7 +800,7 @@ local function dissect_one(buf, pinfo, tree, offset)
     end
 
     pinfo.cols.protocol:set("DGProto")
-    pinfo.cols.info:append(info_str .. "  ")
+    local final_info = info_str  -- may be enriched after decryption
 
     -- ── Decryption (only for types with AEAD tag and non-zero payload) ─────
     if has_tag and payload_len > 0 then
@@ -811,14 +839,15 @@ local function dissect_one(buf, pinfo, tree, offset)
                 dissect_plaintext(pt_tvb, msg_type, dec_tree)
                 proto_tree:add_proto_expert_info(ef_decrypt_ok)
 
-                -- Enrich info column for EncryptedData
-                if msg_type == 0x03 and pt_tvb:len() >= 2 then
-                    local stream_id = pt_tvb(0,2):le_uint()
-                    -- Replace last info entry
-                    local new_info = string.format("[EncryptedData seq=%s stream=%d]",
+                -- Enrich info column after successful decryption
+                if msg_type == 0x03 and pt_tvb:len() >= 4 then
+                    local stream_id = pt_tvb(0, 2):le_uint()
+                    final_info = string.format("[EncryptedData seq=%s stream=%d]",
                         tostring(seq_val), stream_id)
-                    -- Append corrected info (column already has the old one)
-                    pinfo.cols.info:append(new_info .. "  ")
+                elseif msg_type == 0x04 and pt_tvb:len() >= 1 then
+                    local pong = pt_tvb(0, 1):uint() ~= 0
+                    final_info = string.format("[%s seq=%s]",
+                        pong and "Pong" or "Ping", tostring(seq_val))
                 end
             else
                 local reason
@@ -834,6 +863,7 @@ local function dissect_one(buf, pinfo, tree, offset)
         end
     end
 
+    pinfo.cols.info:append(final_info .. "  ")
     return total_len
 end
 

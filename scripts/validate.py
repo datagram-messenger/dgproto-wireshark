@@ -22,6 +22,16 @@ REQUIRED_SNIPPETS = (
     'RFC 8439',
     'CRYPTO_SELFTEST_OK',
     'dgproto:register_heuristic("tcp"',
+    # Handshake sub-dissection (v0.2.0)
+    'dgproto.hs.pattern',
+    'hs_client_ephem',
+    'hs_server_ephem',
+    'hs_noise_payload',
+    'HandshakeInit',
+    'HandshakeResponse',
+    'HandshakeFinish',
+    # Ack individual sequences (v0.2.0)
+    'acked_seq_entry',
 )
 FORBIDDEN_SNIPPETS = (
     "dgproto_decrypt.py",
