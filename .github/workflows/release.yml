@@ -1,4 +1,4 @@
-name: Package release
+name: Release
 
 on:
   push:
@@ -6,11 +6,11 @@ on:
       - 'v*.*.*'
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  package:
-    name: Validate and package tagged revision
+  release:
+    name: Validate, package, and publish
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout tag
@@ -42,12 +42,13 @@ jobs:
           (cd dist && sha256sum --check "$(basename "$archive.sha256")")
           test "$(python -c 'import sys,zipfile; print(len(zipfile.ZipFile(sys.argv[1]).namelist()))' "$archive")" = 3
 
-      - name: Retain package as workflow artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: dgproto-wireshark-${{ github.ref_name }}
-          path: |
-            dist/*.zip
-            dist/*.sha256
-          if-no-files-found: error
-          retention-days: 30
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            dist/dgproto-wireshark-*.zip \
+            dist/dgproto-wireshark-*.zip.sha256
