@@ -111,8 +111,53 @@ Reload or reopen the capture after adding keys. Successful decryption adds a **D
 | Sequence number range | `dgproto.sequence >= 100` |
 | A logical stream | `dgproto.stream_id == 1` |
 | Padded frames | `dgproto.flags.padding == 1` |
-| Protocol errors | `dgproto.error_code` |
+| Error message codes (not validation failures) | `dgproto.error_code` |
+| Close message codes | `dgproto.close_code` |
+| Any protocol diagnostic | `dgproto.validation.code` |
+| A specific diagnostic | `dgproto.validation.code == "ack_count"` |
+| Capture-truncated frames | `dgproto.validation.truncated` |
+| Noncanonical sender header fields | `dgproto.validation.flags || dgproto.validation.reserved` |
 | Decryption failures | `dgproto.decrypt_fail` |
+
+### Protocol diagnostics
+
+Each finding adds a generated string to `dgproto.validation.code` and a focused
+Expert Information filter named `dgproto.validation.<code>`. A frame may have
+multiple findings. These describe the bytes inspected, not a receiver's acceptance
+or rejection decision. Header/Noise diagnostics do not require a keylog; encrypted
+payload checks require successful authentication, except that empty encrypted
+records are diagnosed from their wire length.
+
+| Code | Severity | Condition |
+| --- | --- | --- |
+| `magic` | ERROR | Bad `DGP1` magic on explicitly selected traffic; no lengths are trusted |
+| `version` | WARN | Header version is not 1 |
+| `flags` | NOTE | Sender sets bits other than the supported padding flag |
+| `reserved` | NOTE | Nonzero fixed-header reserved bytes |
+| `padding` | ERROR | Padding flag and pad length disagree |
+| `frame_size` | ERROR | Header describes more than 65,535 total wire bytes |
+| `truncated` | ERROR | Complete header, incomplete frame, and captured length below reported length |
+| `handshake_length` | ERROR | Noise XX flight is not 36 bytes (init), 96 bytes (response), or 64 bytes (finish) |
+| `handshake_pattern` | WARN | Init wrapper's pattern is not Noise XX (1) |
+| `handshake_reserved` | ERROR | Nonzero init-wrapper reserved bytes |
+| `session_id` | ERROR | Nonzero handshake session ID or zero encrypted MVP session ID |
+| `sequence` | ERROR | Nonzero handshake sequence or zero encrypted MVP sequence |
+| `message_type` | WARN | Type is outside the strict MVP profile |
+| `payload_length` | ERROR | Empty encrypted MVP record, short required plaintext prefix, or non-exact Ping/Pong (9 bytes) / RekeyInit (36 bytes) |
+| `payload_value` | ERROR | Nonzero Data reserved byte, Ping/Pong response outside 0/1, Close code outside 0..3, zero Rekey epoch, or invalid control-text UTF-8 |
+| `control_envelope` | ERROR | Close/Error text is not exactly one aligned type-1 TLV after the two-byte code |
+| `ack_count` | ERROR | Ack count is zero or payload size is not exactly `1 + count * 8` |
+
+Fixed-header reserved flags/bytes are **NOTE**, not protocol rejection: Go receivers
+ignore reserved flag bits and preserve header reserved bytes for authentication.
+This does not relax reserved fields inside typed payloads. Close/Error may contain
+only their code (no text); text checks cover envelope size/type and UTF-8, not TLV
+padding-byte contents. Application TLVs remain raw bytes.
+
+After decryption, Info summaries include Close/Error codes, Ack count (with
+`invalid` for inconsistent counts/lengths), and Rekey epoch, alongside existing
+stream and Ping/Pong details. A valid SessionClose is no longer marked by a
+warning-level Error-message expert; a malformed Close can still have diagnostics.
 
 ## Compatibility
 
@@ -129,6 +174,15 @@ Reload or reopen the capture after adding keys. Successful decryption adds a **D
 - Application-specific TLV schemas remain raw bytes.
 - Authenticated trial decryption selects the matching key; keylog direction labels do not determine capture direction.
 - Forward ratchet search is bounded to keep redissection responsive.
+- Sequence/session diagnostics are frame-local: no stateful replay, monotonicity,
+  session binding, or Rekey key-confirm validation is performed.
+- Bounds checks avoid reading unavailable header/payload/tag/padding bytes. A complete
+  header describing an oversized frame is diagnosed before requesting reassembly.
+  Incomplete frames normally request TCP reassembly; `truncated` is emitted only
+  when a full header is available and Wireshark reports more bytes than captured.
+  Short headers, missing TCP segments, and unfinished streams may remain undecoded
+  or awaiting reassembly without that diagnostic. There is no resynchronization scan
+  after invalid magic or an oversized frame.
 - Automated GUI testing is not yet cross-platform.
 
 ## Protocol source of truth
@@ -159,14 +213,21 @@ Python is used only by repository validation and packaging scripts, never by the
 keep decoding reproducible and catch field-layout regressions. `tests/fixtures/make_fixtures.py`
 deterministically generates a libpcap capture, a matching keylog, and the expected
 displayed-field values; the runner loads the plugin in `tshark`, extracts `-T fields`,
-and asserts the results. The fixtures cover:
+and asserts the results in both normal single-pass and `-2` two-pass runs. The
+v0.6.0 suite has 163 deterministic capture frames, with 153 exposing the message-type
+field in the single-pass run; the remainder include partial, rejected, and foreign
+traffic. This is a regression suite, not exhaustive fuzzing or interoperability
+certification. The fixtures cover:
 
 - all three Noise XX handshake flights;
 - encrypted data and every control message type, decrypted via the keylog;
 - padded frames, frames fragmented across TCP segments, and multiple frames coalesced
   into one segment;
-- malformed, truncated, and unknown frames, which must fail safely without crashing,
-  over-reading, or dissecting foreign traffic.
+- malformed headers/Noise wrappers, reserved-field severities, empty encrypted
+  records, control lengths/values, Ack count boundaries, and Close/Error text
+  envelopes (including invalid UTF-8);
+- capture-snaplen truncation of payloads/tags/padding, incomplete headers, and
+  unknown/foreign traffic, with bounded parsing and no Lua runtime errors.
 
 Captures and keylogs are regenerated on every run (under the ignored `build/` directory)
 rather than committed, and contain only synthetic, public material — no real traffic or
@@ -175,6 +236,30 @@ vector so generated frames decrypt under the dissector. If `tshark` is not insta
 field checks are skipped, so run them in CI for full coverage.
 
 ## Releases
+
+### v0.6.0 release notes
+
+- Add bounded fixed-header and Noise XX diagnostics with stable
+  `dgproto.validation.code` values and focused expert filters. Reserved header
+  fields remain receiver-compatible NOTE findings.
+- Validate authenticated control lengths/values, Close/Error type-1 text envelopes
+  and UTF-8, Ack counts/exact lengths, and empty encrypted records.
+- Improve Close/Error, Ack, and Rekey summaries; remove the Error-message warning
+  from valid SessionClose frames.
+- Expand deterministic regression coverage to 163 frames, checked in single-pass
+  and two-pass redissection, including malformed and capture-truncated traffic.
+
+This remains a draft-profile dissector: generic application TLV decoding, stateful
+replay checks, and additional keylog hardening are not part of this release. See
+[Known limitations](#known-limitations) for the precise inspection boundaries.
+
+The package version is supplied through `VERSION` (`dev` by default); release CI
+uses the tag name. There is no embedded plugin version to update. To prepare a
+local archive without tagging or publishing, start from a clean committed revision
+and run `make package LUA=lua5.3 LUAC=luac5.3 VERSION=0.6.0`. Repeat packaging with
+the same inputs/toolchain and compare ZIP bytes and SHA-256 checksums. Reproducible
+ZIP timestamps and a three-file allowlist do not imply cross-toolchain compression
+identity. Remove generated archives and caches after validation.
 
 Pushing a stable SemVer tag such as `v0.3.0` validates the project and publishes:
 
