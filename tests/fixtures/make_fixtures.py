@@ -472,7 +472,7 @@ def build_capture():
 
     # Authenticated malformed control records; no secrets or external crypto.
     for msg_type, minimum in ((3, 4), (4, 9), (5, 2), (6, 1), (8, 36), (9, 2)):
-        for length in range(1, minimum):
+        for length in range(minimum):
             one(encrypted_frame(msg_type, 400 + length, bytes(length)),
                 {"dgproto.validation.code": "payload_length"})
     for msg_type, body in ((4, bytes(10)), (8, _rekey_plaintext(2) + b"x")):

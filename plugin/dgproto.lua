@@ -880,6 +880,11 @@ local function dissect_one(buf, pinfo, tree, offset)
         diagnose(hdr_tree, "message_type")
     end
 
+    if has_tag and payload_len == 0 and (msg_type == 3 or msg_type == 4 or
+        msg_type == 5 or msg_type == 6 or msg_type == 8 or msg_type == 9) then
+        diagnose(proto_tree, "payload_length", "Encrypted message requires a nonempty payload")
+    end
+
     -- Payload
     if payload_len > 0 then
         proto_tree:add(f.payload_raw, buf(offset + HEADER_LEN, payload_len))
