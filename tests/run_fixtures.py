@@ -30,7 +30,7 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "fixtures"))
 import make_fixtures  # noqa: E402
 
-_STRING_FIELDS = {"dgproto.magic"}
+_STRING_FIELDS = {"dgproto.magic", "dgproto.validation.code"}
 _ERROR_MARKERS = (
     "lua error", "lua: error", "dissector bug", "dissector_bug",
     "self-test failed", "runtime error", "stack traceback",

@@ -168,6 +168,7 @@ def _padding(pad_len: int) -> bytes:
 def plain_frame(msg_type: int, sequence: int, payload: bytes, pad_len: int = 0) -> bytes:
     """A frame with no AEAD tag (handshake flights)."""
     header = _header(msg_type, sequence, len(payload), pad_len)
+    header = header[:8] + bytes(16) + header[24:]  # session assigned only after flight 3
     return header + payload + _padding(pad_len)
 
 
@@ -293,6 +294,7 @@ class _Stream:
 # tshark -T fields extraction order (frame.number first). Shared with the runner.
 FIELDS = [
     "frame.number",
+    "dgproto.validation.code",
     "dgproto.magic",
     "dgproto.version",
     "dgproto.msg_type",
@@ -426,6 +428,45 @@ def build_capture():
     one(encrypted_frame(0x7F, 206, b"unknown-type-payload"),
         {**H, "dgproto.msg_type": 0x7F, "dgproto.sequence": 206})
 
+    # Header and handshake diagnostics: each case isolates one wire violation.
+    def mutated(wire, offset, value):
+        return wire[:offset] + bytes([value]) + wire[offset + 1:]
+
+    good = plain_frame(1, 0, _hs_init_payload())
+    for offset, value, code in [(4, 2, "version"), (5, 0x80, "flags"),
+                                (7, 1, "reserved"), (37, 1, "reserved"),
+                                (5, 2, "padding"), (8, 1, "session_id"),
+                                (24, 1, "sequence"), (40, 2, "handshake_pattern"),
+                                (41, 1, "handshake_reserved")]:
+        one(mutated(good, offset, value), {"dgproto.validation.code": code})
+    one(mutated(plain_frame(1, 0, _hs_init_payload(), 1), 5, 0),
+        {"dgproto.validation.code": "padding"})
+    for msg_type, length in [(1, 0), (1, 35), (1, 37), (2, 63), (2, 65), (2, 95), (2, 97)]:
+        one(plain_frame(msg_type, 0, bytes(length)),
+            {"dgproto.validation.code": "handshake_length"} if msg_type == 2 or length < 4 else
+            {"dgproto.validation.code": "handshake_length,handshake_pattern"})
+    for msg_type in (3, 4, 5, 6, 8, 9):
+        wire = encrypted_frame(msg_type, 1, b"synthetic")
+        one(wire[:8] + bytes(16) + wire[24:], {"dgproto.validation.code": "session_id"})
+        one(encrypted_frame(msg_type, 0, b"synthetic"), {"dgproto.validation.code": "sequence"})
+    one(b"XXXX" + bytes(40), {"dgproto.validation.code": "magic"}, absent=["dgproto.msg_type"])
+    one(_header(3, 1, 65535, 0), {"dgproto.validation.code": "frame_size"}, absent=["dgproto.msg_type"])
+    one(encrypted_frame(0x07, 1, b"reserved"), {"dgproto.validation.code": "message_type"})
+    one(encrypted_frame(0x7f, 1, b"unknown"), {"dgproto.validation.code": "message_type"})
+
+    # A malformed reassembled handshake emits diagnostics only after completion.
+    bad = mutated(good, 24, 1)
+    stream = _new_stream(port)
+    cap.add(stream.to_server(bad[:13]), absent=["dgproto.validation.code"])
+    cap.add(stream.to_server(bad[13:]), {"dgproto.validation.code": "sequence"})
+    # Canonical padded handshake and large uint64 sequences are valid.
+    one(plain_frame(2, 0, _hs_finish_payload(), 255), absent=["dgproto.validation.code"])
+    one(encrypted_frame(3, (1 << 64) - 1, bytes(4)), absent=["dgproto.validation.code"])
+
+    # Existing happy paths must stay diagnostic-free; the post-MVP and malformed
+    # baseline probes are intentionally not canonical.
+    for n in (1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, 15):
+        cap.frames[n]["absent"].append("dgproto.validation.code")
     return cap.pcap_bytes(), keylog_text(), cap.frames
 
 

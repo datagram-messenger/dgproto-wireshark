@@ -98,7 +98,43 @@ local ef_decrypt_fail = ProtoExpert.new(
     "dgproto.decrypt_fail", "Decryption failed",
     expert.group.DECRYPTION, expert.severity.WARN
 )
+-- Stable codes are shared by Expert Information and a single display filter.
+f.validation_code = ProtoField.string("dgproto.validation.code", "Validation diagnostic")
+local validation_experts = {}
+local diagnostic_specs = {
+    {"magic", "Invalid DGProto magic", expert.severity.ERROR},
+    {"version", "Unsupported DGProto version", expert.severity.WARN},
+    {"flags", "Noncanonical sender flags (ignored by receivers)", expert.severity.NOTE},
+    {"reserved", "Nonzero sender reserved bytes (preserved by receivers)", expert.severity.NOTE},
+    {"padding", "Padding flag and length disagree", expert.severity.ERROR},
+    {"frame_size", "Frame exceeds 65535-byte wire limit", expert.severity.ERROR},
+    {"truncated", "Capture truncates a DGProto frame", expert.severity.ERROR},
+    {"handshake_length", "Invalid Noise XX flight length", expert.severity.ERROR},
+    {"handshake_pattern", "Unsupported Noise handshake pattern", expert.severity.WARN},
+    {"handshake_reserved", "Nonzero handshake reserved bytes", expert.severity.ERROR},
+    {"session_id", "Invalid session ID for frame class", expert.severity.ERROR},
+    {"sequence", "Invalid sequence for frame class", expert.severity.ERROR},
+    {"message_type", "Message type is outside the strict MVP profile", expert.severity.WARN},
+}
 dgproto.experts = { ef_handshake, ef_encrypted, ef_error, ef_decrypt_ok, ef_decrypt_fail }
+for _, spec in ipairs(diagnostic_specs) do
+    local item = ProtoExpert.new("dgproto.validation." .. spec[1], spec[2],
+        expert.group.PROTOCOL, spec[3])
+    validation_experts[spec[1]] = item
+    dgproto.experts[#dgproto.experts + 1] = item
+end
+
+local function diagnose(tree, code, detail)
+    tree:add(f.validation_code, code):set_generated()
+    tree:add_proto_expert_info(validation_experts[code], detail)
+end
+
+local function range_is_zero(buf, offset, length)
+    for i = offset, offset + length - 1 do
+        if buf(i, 1):uint() ~= 0 then return false end
+    end
+    return true
+end
 
 -- ── Constants ─────────────────────────────────────────────────────────────────
 local MAGIC        = "DGP1"
@@ -698,7 +734,9 @@ local function dissect_one(buf, pinfo, tree, offset)
     -- Check magic
     local magic_bytes = buf(offset, 4):string()
     if magic_bytes ~= MAGIC then
-        return -1  -- not our protocol
+        local bad_tree = tree:add(dgproto, buf(offset, remaining), "Invalid DGProto header")
+        diagnose(bad_tree, "magic", "Expected DGP1 on the configured TCP port")
+        return -1  -- never trust lengths or claim arbitrary bytes after bad magic
     end
 
     local msg_type   = buf(offset + 6,  1):uint()
@@ -714,9 +752,19 @@ local function dissect_one(buf, pinfo, tree, offset)
 
     local total_len  = HEADER_LEN + payload_len + tag_len + pad_len
 
+    if total_len > 65535 then
+        local bad_tree = tree:add(dgproto, buf(offset, HEADER_LEN), "Invalid DGProto length")
+        diagnose(bad_tree, "frame_size", "Declared wire size exceeds 65535 bytes")
+        return remaining  -- consume invalid framing once; do not invoke heuristics again
+    end
     if remaining < total_len then
-        pinfo.desegment_offset = offset
-        pinfo.desegment_len    = total_len - remaining
+        if buf:reported_len() > buf_len then
+            local bad_tree = tree:add(dgproto, buf(offset, remaining), "Truncated DGProto frame")
+            diagnose(bad_tree, "truncated", "Captured bytes are shorter than reported wire bytes")
+        else
+            pinfo.desegment_offset = offset
+            pinfo.desegment_len    = total_len - remaining
+        end
         return 0
     end
 
@@ -738,6 +786,36 @@ local function dissect_one(buf, pinfo, tree, offset)
     hdr_tree:add_le         (f.payload_len, buf(offset + 32, 4))
     hdr_tree:add            (f.pad_len,     buf(offset + 36, 1))
     hdr_tree:add            (f.reserved2,   buf(offset + 37, 3))
+
+    local flags = buf(offset + 5, 1):uint()
+    if buf(offset + 4, 1):uint() ~= 1 then diagnose(hdr_tree, "version") end
+    if flags - (flags % 4 - flags % 2) ~= 0 then diagnose(hdr_tree, "flags") end
+    if not range_is_zero(buf, offset + 7, 1) or not range_is_zero(buf, offset + 37, 3) then
+        diagnose(hdr_tree, "reserved")
+    end
+    if (flags % 4 >= 2) ~= (pad_len > 0) then diagnose(hdr_tree, "padding") end
+    local session_zero = range_is_zero(buf, offset + 8, 16)
+    local sequence_zero = range_is_zero(buf, offset + 24, 8)
+    if not has_tag then
+        if not session_zero then diagnose(hdr_tree, "session_id", "Handshake SessionID must be zero") end
+        if not sequence_zero then diagnose(hdr_tree, "sequence", "Handshake sequence must be zero") end
+        if (msg_type == 1 and payload_len ~= 36) or
+            (msg_type == 2 and payload_len ~= 64 and payload_len ~= 96) then
+            diagnose(proto_tree, "handshake_length")
+        end
+        if msg_type == 1 and payload_len >= 4 then
+            if buf(offset + HEADER_LEN, 1):uint() ~= 1 then diagnose(proto_tree, "handshake_pattern") end
+            if not range_is_zero(buf, offset + HEADER_LEN + 1, 3) then
+                diagnose(proto_tree, "handshake_reserved")
+            end
+        end
+    elseif msg_type == 3 or msg_type == 4 or msg_type == 5 or msg_type == 6 or
+        msg_type == 8 or msg_type == 9 then
+        if session_zero then diagnose(hdr_tree, "session_id", "Encrypted SessionID must be nonzero") end
+        if sequence_zero then diagnose(hdr_tree, "sequence", "Encrypted sequence must be nonzero") end
+    else
+        diagnose(hdr_tree, "message_type")
+    end
 
     -- Payload
     if payload_len > 0 then
