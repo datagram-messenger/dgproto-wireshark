@@ -442,9 +442,8 @@ def build_capture():
     one(mutated(plain_frame(1, 0, _hs_init_payload(), 1), 5, 0),
         {"dgproto.validation.code": "padding"})
     for msg_type, length in [(1, 0), (1, 35), (1, 37), (2, 63), (2, 65), (2, 95), (2, 97)]:
-        one(plain_frame(msg_type, 0, bytes(length)),
-            {"dgproto.validation.code": "handshake_length"} if msg_type == 2 or length < 4 else
-            {"dgproto.validation.code": "handshake_length,handshake_pattern"})
+        payload = (_hs_init_payload() + bytes(100))[:length] if msg_type == 1 else bytes(length)
+        one(plain_frame(msg_type, 0, payload), {"dgproto.validation.code": "handshake_length"})
     for msg_type in (3, 4, 5, 6, 8, 9):
         wire = encrypted_frame(msg_type, 1, b"synthetic")
         one(wire[:8] + bytes(16) + wire[24:], {"dgproto.validation.code": "session_id"})
