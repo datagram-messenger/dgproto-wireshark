@@ -321,12 +321,12 @@ FIELDS = [
 
 class _Capture:
     def __init__(self) -> None:
-        self.packets: list = []       # (ts_sec, ts_usec, bytes)
+        self.packets: list = []       # (ts_sec, ts_usec, bytes, reported_length)
         self.frames: dict = {}        # frame_number -> {"fields": {...}, "absent": [...]}
         self._ts = 1577836800         # 2020-01-01T00:00:00Z, fixed for determinism
 
-    def add(self, data: bytes, fields=None, absent=None) -> int:
-        self.packets.append((self._ts, 0, data))
+    def add(self, data: bytes, fields=None, absent=None, reported_length=None) -> int:
+        self.packets.append((self._ts, 0, data, reported_length or len(data)))
         self._ts += 1
         n = len(self.packets)
         self.frames[n] = {"fields": fields or {}, "absent": absent or []}
@@ -334,8 +334,8 @@ class _Capture:
 
     def pcap_bytes(self) -> bytes:
         out = bytearray(_PCAP_GLOBAL)
-        for ts_sec, ts_usec, data in self.packets:
-            out += struct.pack("<IIII", ts_sec, ts_usec, len(data), len(data))
+        for ts_sec, ts_usec, data, reported_length in self.packets:
+            out += struct.pack("<IIII", ts_sec, ts_usec, len(data), reported_length)
             out += data
         return bytes(out)
 
@@ -498,6 +498,14 @@ def build_capture():
         one(encrypted_frame(msg_type, 457, _text_plaintext(0, b"ab")[:-3] + b"XYZ"),
             absent=["dgproto.validation.code"])
     one(encrypted_frame(6, 458, _ack_plaintext(list(range(255)))), absent=["dgproto.validation.code"])
+    wire = encrypted_frame(6, 459, b"\x02" + struct.pack("<Q", 1))
+    stream = _new_stream(port)
+    cap.add(stream.to_server(wire[:44]), absent=["dgproto.validation.code"])
+    cap.add(stream.to_server(wire[44:]), {"dgproto.validation.code": "ack_count", "dgproto.acked_seq": 1})
+    for cut in (HEADER_LEN + 1, len(wire) - 1):
+        packet = _new_stream(port).to_server(wire)
+        captured = packet[:54 + cut]
+        cap.add(captured, {"dgproto.validation.code": "truncated"}, reported_length=len(packet))
     cap.frames[8]["fields"]["_ws.col.Info"] = "[SessionClose seq=104 code=2]"
     cap.frames[9]["fields"]["_ws.col.Info"] = "[Ack seq=105 count=3]"
     cap.frames[11]["fields"]["_ws.col.Info"] = "[RekeyInit seq=107 epoch=1]"

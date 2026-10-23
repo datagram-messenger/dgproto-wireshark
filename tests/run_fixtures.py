@@ -48,7 +48,7 @@ def _split_occurrences(raw: str) -> list:
 
 
 def _run_tshark(tshark: str, plugin: pathlib.Path, pcap: pathlib.Path,
-                keylog: pathlib.Path, fields: list):
+                keylog: pathlib.Path, fields: list, two_pass: bool = False):
     cmd = [
         tshark, "-r", str(pcap),
         "-X", f"lua_script:{plugin.resolve()}",
@@ -58,6 +58,8 @@ def _run_tshark(tshark: str, plugin: pathlib.Path, pcap: pathlib.Path,
         # explicitly so multi-occurrence fields come back comma-joined.
         "-T", "fields", "-E", "occurrence=a", "-E", "aggregator=,",
     ]
+    if two_pass:
+        cmd.append("-2")
     for name in fields:
         cmd += ["-e", name]
     env = dict(os.environ)
@@ -151,6 +153,14 @@ def run(plugin: pathlib.Path, tshark: str, out_dir: pathlib.Path, keep: bool) ->
     problems = []
     for frame_no, spec in frames.items():
         problems += _check_frame(frame_no, spec, rows.get(frame_no, {}))
+
+    revisited = _run_tshark(executable, plugin, pcap_path, keylog_path, fields, two_pass=True)
+    if revisited.returncode != 0 or any(m in (revisited.stdout + revisited.stderr).lower() for m in _ERROR_MARKERS):
+        problems.append(f"two-pass redissection failed: {revisited.stderr}")
+    else:
+        revisit_rows = _parse_rows(revisited.stdout, fields)
+        for frame_no, spec in frames.items():
+            problems += _check_frame(frame_no, spec, revisit_rows.get(frame_no, {}))
 
     if problems:
         print(f"FAIL: {len(problems)} field-layout mismatch(es):", file=sys.stderr)
