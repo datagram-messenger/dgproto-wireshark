@@ -301,6 +301,7 @@ FIELDS = [
     "frame.number",
     "dgproto.validation.code",
     "_ws.col.Info",
+    "dgproto.error",
     "dgproto.magic",
     "dgproto.version",
     "dgproto.msg_type",
@@ -506,6 +507,8 @@ def build_capture():
         packet = _new_stream(port).to_server(wire)
         captured = packet[:54 + cut]
         cap.add(captured, {"dgproto.validation.code": "truncated"}, reported_length=len(packet))
+    cap.frames[8]["absent"].append("dgproto.error")
+    one(encrypted_frame(5, 460, bytes(2)), absent=["dgproto.error", "dgproto.validation.code"])
     cap.frames[8]["fields"]["_ws.col.Info"] = "[SessionClose seq=104 code=2]"
     cap.frames[9]["fields"]["_ws.col.Info"] = "[Ack seq=105 count=3]"
     cap.frames[11]["fields"]["_ws.col.Info"] = "[RekeyInit seq=107 epoch=1]"

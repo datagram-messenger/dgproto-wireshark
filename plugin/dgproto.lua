@@ -932,7 +932,7 @@ local function dissect_one(buf, pinfo, tree, offset)
     elseif msg_type == 0x04 then
         info_str = string.format("[Ping seq=%s]", tostring(seq_val))
         proto_tree:add_proto_expert_info(ef_encrypted)
-    elseif msg_type == 0x05 or msg_type == 0x09 then
+    elseif msg_type == 0x09 then
         info_str = string.format("[%s seq=%s]", msg_name, tostring(seq_val))
         proto_tree:add_proto_expert_info(ef_error)
     else
