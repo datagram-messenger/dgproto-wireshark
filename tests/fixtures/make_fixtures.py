@@ -220,8 +220,13 @@ def _ping_plaintext(is_response: int) -> bytes:
     return bytes([is_response & 0xFF]) + bytes((base + i) & 0xFF for i in range(8))
 
 
+def _text_plaintext(code: int, text: bytes) -> bytes:
+    tlv = b"\x01" + struct.pack("<H", len(text)) + text
+    return struct.pack("<H", code) + tlv + bytes((-len(tlv)) % 4)
+
+
 def _close_plaintext(code: int) -> bytes:
-    return struct.pack("<H", code) + b"\x00\x0eprotocol error"  # TLV-ish reason bytes
+    return _text_plaintext(code, b"protocol error")
 
 
 def _ack_plaintext(seqs: list) -> bytes:
@@ -236,7 +241,7 @@ def _rekey_plaintext(epoch: int) -> bytes:
 
 
 def _error_plaintext(code: int) -> bytes:
-    return struct.pack("<H", code) + b"synthetic"
+    return _text_plaintext(code, b"synthetic")
 
 
 # ── Ethernet / IPv4 / TCP framing + libpcap writer ───────────────────────────
@@ -295,6 +300,7 @@ class _Stream:
 FIELDS = [
     "frame.number",
     "dgproto.validation.code",
+    "_ws.col.Info",
     "dgproto.magic",
     "dgproto.version",
     "dgproto.msg_type",
@@ -447,7 +453,9 @@ def build_capture():
     for msg_type in (3, 4, 5, 6, 8, 9):
         wire = encrypted_frame(msg_type, 1, b"synthetic")
         one(wire[:8] + bytes(16) + wire[24:], {"dgproto.validation.code": "session_id"})
-        one(encrypted_frame(msg_type, 0, b"synthetic"), {"dgproto.validation.code": "sequence"})
+        body = {3: bytes(4), 4: _ping_plaintext(0), 5: bytes(2),
+                6: _ack_plaintext([1]), 8: _rekey_plaintext(2), 9: bytes(2)}[msg_type]
+        one(encrypted_frame(msg_type, 0, body), {"dgproto.validation.code": "sequence"})
     one(b"XXXX" + bytes(40), {"dgproto.validation.code": "magic"}, absent=["dgproto.msg_type"])
     one(_header(3, 1, 65535, 0), {"dgproto.validation.code": "frame_size"}, absent=["dgproto.msg_type"])
     one(encrypted_frame(0x07, 1, b"reserved"), {"dgproto.validation.code": "message_type"})
@@ -461,6 +469,39 @@ def build_capture():
     # Canonical padded handshake and large uint64 sequences are valid.
     one(plain_frame(2, 0, _hs_finish_payload(), 255), absent=["dgproto.validation.code"])
     one(encrypted_frame(3, (1 << 64) - 1, bytes(4)), absent=["dgproto.validation.code"])
+
+    # Authenticated malformed control records; no secrets or external crypto.
+    for msg_type, minimum in ((3, 4), (4, 9), (5, 2), (6, 1), (8, 36), (9, 2)):
+        for length in range(1, minimum):
+            one(encrypted_frame(msg_type, 400 + length, bytes(length)),
+                {"dgproto.validation.code": "payload_length"})
+    for msg_type, body in ((4, bytes(10)), (8, _rekey_plaintext(2) + b"x")):
+        one(encrypted_frame(msg_type, 450, body), {"dgproto.validation.code": "payload_length"})
+    for msg_type, body in ((3, b"\x00\x00\x00\x01"), (4, b"\x02" + bytes(8)),
+                           (5, struct.pack("<H", 4)), (8, bytes(36))):
+        one(encrypted_frame(msg_type, 451, body), {"dgproto.validation.code": "payload_value"})
+    for body in (b"\x00", b"\x02" + struct.pack("<Q", 10),
+                 _ack_plaintext([10]) + b"x", b"\xff" + bytes(8)):
+        one(encrypted_frame(6, 452, body), {"dgproto.validation.code": "ack_count"})
+    for msg_type in (5, 9):
+        for body in (b"\x00\x00x", b"\x00\x00\x02\x00\x00\x00",
+                     _text_plaintext(0, b"abc")[:-1],
+                     _text_plaintext(0, b"abc") + bytes(4)):
+            one(encrypted_frame(msg_type, 453, body), {"dgproto.validation.code": "control_envelope"})
+        for text in (b"\xc0\x80", b"\xed\xa0\x80", b"\xf4\x90\x80\x80", b"\xe2\x82", b"\xff"):
+            one(encrypted_frame(msg_type, 454, _text_plaintext(0, text)),
+                {"dgproto.validation.code": "payload_value"})
+        for text in (b"", b"a", b"ab", b"abc", b"abcd", "Привет 😀".encode("utf-8"), b"a\x00b"):
+            one(encrypted_frame(msg_type, 455, _text_plaintext(0, text)), absent=["dgproto.validation.code"])
+        one(encrypted_frame(msg_type, 456, bytes(2)), absent=["dgproto.validation.code"])
+        # Alignment octets are opaque, not required to be zero on receive.
+        one(encrypted_frame(msg_type, 457, _text_plaintext(0, b"ab")[:-3] + b"XYZ"),
+            absent=["dgproto.validation.code"])
+    one(encrypted_frame(6, 458, _ack_plaintext(list(range(255)))), absent=["dgproto.validation.code"])
+    cap.frames[8]["fields"]["_ws.col.Info"] = "[SessionClose seq=104 code=2]"
+    cap.frames[9]["fields"]["_ws.col.Info"] = "[Ack seq=105 count=3]"
+    cap.frames[11]["fields"]["_ws.col.Info"] = "[RekeyInit seq=107 epoch=1]"
+    cap.frames[12]["fields"]["_ws.col.Info"] = "[Error seq=108 code=42]"
 
     # Existing happy paths must stay diagnostic-free; the post-MVP and malformed
     # baseline probes are intentionally not canonical.

@@ -102,6 +102,10 @@ local ef_decrypt_fail = ProtoExpert.new(
 f.validation_code = ProtoField.string("dgproto.validation.code", "Validation diagnostic")
 local validation_experts = {}
 local diagnostic_specs = {
+    {"payload_length", "Invalid control payload length", expert.severity.ERROR},
+    {"payload_value", "Invalid control payload value", expert.severity.ERROR},
+    {"control_envelope", "Noncanonical control text envelope", expert.severity.ERROR},
+    {"ack_count", "Ack count does not match sequence entries", expert.severity.ERROR},
     {"magic", "Invalid DGProto magic", expert.severity.ERROR},
     {"version", "Unsupported DGProto version", expert.severity.WARN},
     {"flags", "Noncanonical sender flags (ignored by receivers)", expert.severity.NOTE},
@@ -665,13 +669,63 @@ local function build_nonce_hex(buf, seq_offset)
     return table.concat(t)
 end
 
+-- UTF-8 validation without Lua-version-specific libraries; reject overlong,
+-- surrogate, truncated and out-of-range encodings, but allow embedded NUL.
+local function valid_utf8(buf, offset, length)
+    local finish = offset + length
+    while offset < finish do
+        local first = buf(offset, 1):uint()
+        local count, low, high = 0, 0x80, 0xbf
+        if first < 0x80 then count = 1
+        elseif first >= 0xc2 and first <= 0xdf then count = 2
+        elseif first >= 0xe0 and first <= 0xef then
+            count = 3
+            if first == 0xe0 then low = 0xa0 elseif first == 0xed then high = 0x9f end
+        elseif first >= 0xf0 and first <= 0xf4 then
+            count = 4
+            if first == 0xf0 then low = 0x90 elseif first == 0xf4 then high = 0x8f end
+        else return false end
+        if offset + count > finish then return false end
+        for i = 1, count - 1 do
+            local value = buf(offset + i, 1):uint()
+            if value < (i == 1 and low or 0x80) or value > (i == 1 and high or 0xbf) then return false end
+        end
+        offset = offset + count
+    end
+    return true
+end
+
+local function validate_control_text(buf, tree)
+    local length = buf:len()
+    if length <= 2 then return end
+    if length < 5 then diagnose(tree, "control_envelope", "Text TLV header is truncated"); return end
+    local text_length = buf(3, 2):le_uint()
+    local encoded = 3 + text_length
+    encoded = encoded + (4 - encoded % 4) % 4
+    if buf(2, 1):uint() ~= 1 or length ~= 2 + encoded then
+        diagnose(tree, "control_envelope", "Expected exactly one aligned type-1 text TLV")
+        return
+    end
+    if not valid_utf8(buf, 5, text_length) then
+        diagnose(tree, "payload_value", "Control text is not valid UTF-8")
+    end
+end
+
 -- ── Plaintext sub-dissection ──────────────────────────────────────────────────
 local function dissect_plaintext(pt_tvb, msg_type, tree)
+    local length = pt_tvb:len()
+    local minimum = ({[3]=4, [4]=9, [5]=2, [6]=1, [8]=36, [9]=2})[msg_type]
+    if msg_type == 5 or msg_type == 9 then validate_control_text(pt_tvb, tree) end
+    if minimum and (length < minimum or ((msg_type == 4 or msg_type == 8) and length ~= minimum)) then
+        diagnose(tree, "payload_length", string.format("Type 0x%02x has %d bytes; expected %s%d",
+            msg_type, length, (msg_type == 4 or msg_type == 8) and "" or "at least ", minimum))
+    end
     if msg_type == 0x03 then  -- EncryptedData
         if pt_tvb:len() < 4 then return end
         tree:add_le(f.stream_id,    pt_tvb(0, 2))
         tree:add   (f.app_msg_type, pt_tvb(2, 1))
         tree:add   (f.app_reserved, pt_tvb(3, 1))
+        if pt_tvb(3, 1):uint() ~= 0 then diagnose(tree, "payload_value", "Data reserved byte must be zero") end
         if pt_tvb:len() > 4 then
             tree:add(f.tlv_data, pt_tvb(4))
         end
@@ -680,10 +734,12 @@ local function dissect_plaintext(pt_tvb, msg_type, tree)
         if pt_tvb:len() < 9 then return end
         tree:add(f.is_response, pt_tvb(0, 1))
         tree:add(f.ping_nonce,  pt_tvb(1, 8))
+        if pt_tvb(0, 1):uint() > 1 then diagnose(tree, "payload_value", "Ping response must be 0 or 1") end
 
     elseif msg_type == 0x05 then  -- SessionClose
         if pt_tvb:len() < 2 then return end
         tree:add_le(f.close_code, pt_tvb(0, 2))
+        if pt_tvb(0, 2):le_uint() > 3 then diagnose(tree, "payload_value", "Close code must be 0 through 3") end
         if pt_tvb:len() > 2 then
             tree:add(f.close_reason, pt_tvb(2))
         end
@@ -692,8 +748,13 @@ local function dissect_plaintext(pt_tvb, msg_type, tree)
         if pt_tvb:len() < 1 then return end
         local count = pt_tvb(0,1):uint()
         tree:add(f.acked_count, pt_tvb(0, 1))
-        if pt_tvb:len() >= 1 + count * 8 then
-            for i = 0, count - 1 do
+        if count == 0 or length ~= 1 + count * 8 then
+            diagnose(tree, "ack_count", string.format("Count %d requires %d bytes; received %d",
+                count, 1 + count * 8, length))
+        end
+        local available = math.min(count, math.floor((length - 1) / 8))
+        if available > 0 then
+            for i = 0, available - 1 do
                 tree:add_le(f.acked_seq_entry, pt_tvb(1 + i * 8, 8))
             end
         end
@@ -701,6 +762,7 @@ local function dissect_plaintext(pt_tvb, msg_type, tree)
     elseif msg_type == 0x08 then  -- RekeyInit
         if pt_tvb:len() < 36 then return end
         tree:add_le(f.rekey_epoch, pt_tvb(0, 4))
+        if pt_tvb(0, 4):le_uint() == 0 then diagnose(tree, "payload_value", "Rekey epoch must be nonzero") end
         tree:add   (f.key_confirm, pt_tvb(4, 32))
 
     elseif msg_type == 0x09 then  -- Error
@@ -917,10 +979,21 @@ local function dissect_one(buf, pinfo, tree, offset)
                     local stream_id = pt_tvb(0, 2):le_uint()
                     final_info = string.format("[EncryptedData seq=%s stream=%d]",
                         tostring(seq_val), stream_id)
-                elseif msg_type == 0x04 and pt_tvb:len() >= 1 then
-                    local pong = pt_tvb(0, 1):uint() ~= 0
+                elseif msg_type == 0x04 and pt_tvb:len() == 9 and pt_tvb(0, 1):uint() <= 1 then
+                    local pong = pt_tvb(0, 1):uint() == 1
                     final_info = string.format("[%s seq=%s]",
                         pong and "Pong" or "Ping", tostring(seq_val))
+                elseif (msg_type == 5 or msg_type == 9) and pt_tvb:len() >= 2 then
+                    final_info = string.format("[%s seq=%s code=%d]", msg_name,
+                        tostring(seq_val), pt_tvb(0, 2):le_uint())
+                elseif msg_type == 6 and pt_tvb:len() >= 1 then
+                    local count = pt_tvb(0, 1):uint()
+                    local canonical = count > 0 and pt_tvb:len() == 1 + count * 8
+                    final_info = string.format("[Ack seq=%s count=%d%s]", tostring(seq_val),
+                        count, canonical and "" or " invalid")
+                elseif msg_type == 8 and pt_tvb:len() == 36 then
+                    final_info = string.format("[RekeyInit seq=%s epoch=%d]",
+                        tostring(seq_val), pt_tvb(0, 4):le_uint())
                 end
             else
                 local reason
@@ -946,6 +1019,7 @@ function dgproto.dissector(buf, pinfo, tree)
     if buf_len < 4 then return 0 end
 
     pinfo.cols.protocol:set("DGProto")
+    pinfo.cols.info:clear()
 
     local offset = 0
     while offset < buf_len do
