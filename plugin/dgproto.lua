@@ -675,7 +675,8 @@ local function valid_utf8(buf, offset, length)
     local finish = offset + length
     while offset < finish do
         local first = buf(offset, 1):uint()
-        local count, low, high = 0, 0x80, 0xbf
+        local count, low, high
+        low, high = 0x80, 0xbf
         if first < 0x80 then count = 1
         elseif first >= 0xc2 and first <= 0xdf then count = 2
         elseif first >= 0xe0 and first <= 0xef then
