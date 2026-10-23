@@ -213,14 +213,21 @@ Python is used only by repository validation and packaging scripts, never by the
 keep decoding reproducible and catch field-layout regressions. `tests/fixtures/make_fixtures.py`
 deterministically generates a libpcap capture, a matching keylog, and the expected
 displayed-field values; the runner loads the plugin in `tshark`, extracts `-T fields`,
-and asserts the results. The fixtures cover:
+and asserts the results in both normal single-pass and `-2` two-pass runs. The
+v0.6.0 suite has 163 deterministic capture frames, with 153 exposing the message-type
+field in the single-pass run; the remainder include partial, rejected, and foreign
+traffic. This is a regression suite, not exhaustive fuzzing or interoperability
+certification. The fixtures cover:
 
 - all three Noise XX handshake flights;
 - encrypted data and every control message type, decrypted via the keylog;
 - padded frames, frames fragmented across TCP segments, and multiple frames coalesced
   into one segment;
-- malformed, truncated, and unknown frames, which must fail safely without crashing,
-  over-reading, or dissecting foreign traffic.
+- malformed headers/Noise wrappers, reserved-field severities, empty encrypted
+  records, control lengths/values, Ack count boundaries, and Close/Error text
+  envelopes (including invalid UTF-8);
+- capture-snaplen truncation of payloads/tags/padding, incomplete headers, and
+  unknown/foreign traffic, with bounded parsing and no Lua runtime errors.
 
 Captures and keylogs are regenerated on every run (under the ignored `build/` directory)
 rather than committed, and contain only synthetic, public material — no real traffic or
@@ -229,6 +236,30 @@ vector so generated frames decrypt under the dissector. If `tshark` is not insta
 field checks are skipped, so run them in CI for full coverage.
 
 ## Releases
+
+### v0.6.0 release notes
+
+- Add bounded fixed-header and Noise XX diagnostics with stable
+  `dgproto.validation.code` values and focused expert filters. Reserved header
+  fields remain receiver-compatible NOTE findings.
+- Validate authenticated control lengths/values, Close/Error type-1 text envelopes
+  and UTF-8, Ack counts/exact lengths, and empty encrypted records.
+- Improve Close/Error, Ack, and Rekey summaries; remove the Error-message warning
+  from valid SessionClose frames.
+- Expand deterministic regression coverage to 163 frames, checked in single-pass
+  and two-pass redissection, including malformed and capture-truncated traffic.
+
+This remains a draft-profile dissector: generic application TLV decoding, stateful
+replay checks, and additional keylog hardening are not part of this release. See
+[Known limitations](#known-limitations) for the precise inspection boundaries.
+
+The package version is supplied through `VERSION` (`dev` by default); release CI
+uses the tag name. There is no embedded plugin version to update. To prepare a
+local archive without tagging or publishing, start from a clean committed revision
+and run `make package LUA=lua5.3 LUAC=luac5.3 VERSION=0.6.0`. Repeat packaging with
+the same inputs/toolchain and compare ZIP bytes and SHA-256 checksums. Reproducible
+ZIP timestamps and a three-file allowlist do not imply cross-toolchain compression
+identity. Remove generated archives and caches after validation.
 
 Pushing a stable SemVer tag such as `v0.3.0` validates the project and publishes:
 
