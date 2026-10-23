@@ -111,8 +111,53 @@ Reload or reopen the capture after adding keys. Successful decryption adds a **D
 | Sequence number range | `dgproto.sequence >= 100` |
 | A logical stream | `dgproto.stream_id == 1` |
 | Padded frames | `dgproto.flags.padding == 1` |
-| Protocol errors | `dgproto.error_code` |
+| Error message codes (not validation failures) | `dgproto.error_code` |
+| Close message codes | `dgproto.close_code` |
+| Any protocol diagnostic | `dgproto.validation.code` |
+| A specific diagnostic | `dgproto.validation.code == "ack_count"` |
+| Capture-truncated frames | `dgproto.validation.truncated` |
+| Noncanonical sender header fields | `dgproto.validation.flags || dgproto.validation.reserved` |
 | Decryption failures | `dgproto.decrypt_fail` |
+
+### Protocol diagnostics
+
+Each finding adds a generated string to `dgproto.validation.code` and a focused
+Expert Information filter named `dgproto.validation.<code>`. A frame may have
+multiple findings. These describe the bytes inspected, not a receiver's acceptance
+or rejection decision. Header/Noise diagnostics do not require a keylog; encrypted
+payload checks require successful authentication, except that empty encrypted
+records are diagnosed from their wire length.
+
+| Code | Severity | Condition |
+| --- | --- | --- |
+| `magic` | ERROR | Bad `DGP1` magic on explicitly selected traffic; no lengths are trusted |
+| `version` | WARN | Header version is not 1 |
+| `flags` | NOTE | Sender sets bits other than the supported padding flag |
+| `reserved` | NOTE | Nonzero fixed-header reserved bytes |
+| `padding` | ERROR | Padding flag and pad length disagree |
+| `frame_size` | ERROR | Header describes more than 65,535 total wire bytes |
+| `truncated` | ERROR | Complete header, incomplete frame, and captured length below reported length |
+| `handshake_length` | ERROR | Noise XX flight is not 36 bytes (init), 96 bytes (response), or 64 bytes (finish) |
+| `handshake_pattern` | WARN | Init wrapper's pattern is not Noise XX (1) |
+| `handshake_reserved` | ERROR | Nonzero init-wrapper reserved bytes |
+| `session_id` | ERROR | Nonzero handshake session ID or zero encrypted MVP session ID |
+| `sequence` | ERROR | Nonzero handshake sequence or zero encrypted MVP sequence |
+| `message_type` | WARN | Type is outside the strict MVP profile |
+| `payload_length` | ERROR | Empty encrypted MVP record, short required plaintext prefix, or non-exact Ping/Pong (9 bytes) / RekeyInit (36 bytes) |
+| `payload_value` | ERROR | Nonzero Data reserved byte, Ping/Pong response outside 0/1, Close code outside 0..3, zero Rekey epoch, or invalid control-text UTF-8 |
+| `control_envelope` | ERROR | Close/Error text is not exactly one aligned type-1 TLV after the two-byte code |
+| `ack_count` | ERROR | Ack count is zero or payload size is not exactly `1 + count * 8` |
+
+Fixed-header reserved flags/bytes are **NOTE**, not protocol rejection: Go receivers
+ignore reserved flag bits and preserve header reserved bytes for authentication.
+This does not relax reserved fields inside typed payloads. Close/Error may contain
+only their code (no text); text checks cover envelope size/type and UTF-8, not TLV
+padding-byte contents. Application TLVs remain raw bytes.
+
+After decryption, Info summaries include Close/Error codes, Ack count (with
+`invalid` for inconsistent counts/lengths), and Rekey epoch, alongside existing
+stream and Ping/Pong details. A valid SessionClose is no longer marked by a
+warning-level Error-message expert; a malformed Close can still have diagnostics.
 
 ## Compatibility
 
@@ -129,6 +174,15 @@ Reload or reopen the capture after adding keys. Successful decryption adds a **D
 - Application-specific TLV schemas remain raw bytes.
 - Authenticated trial decryption selects the matching key; keylog direction labels do not determine capture direction.
 - Forward ratchet search is bounded to keep redissection responsive.
+- Sequence/session diagnostics are frame-local: no stateful replay, monotonicity,
+  session binding, or Rekey key-confirm validation is performed.
+- Bounds checks avoid reading unavailable header/payload/tag/padding bytes. A complete
+  header describing an oversized frame is diagnosed before requesting reassembly.
+  Incomplete frames normally request TCP reassembly; `truncated` is emitted only
+  when a full header is available and Wireshark reports more bytes than captured.
+  Short headers, missing TCP segments, and unfinished streams may remain undecoded
+  or awaiting reassembly without that diagnostic. There is no resynchronization scan
+  after invalid magic or an oversized frame.
 - Automated GUI testing is not yet cross-platform.
 
 ## Protocol source of truth
